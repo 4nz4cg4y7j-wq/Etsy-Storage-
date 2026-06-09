@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sign in — ShopTracker Pro</title>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import {
+  getAuth,
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
+  sendPasswordResetEmail,
+  onAuthStateChanged,
+  updateProfile
+} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+import {
+  getFirestore, doc, setDoc, getDoc, serverTimestamp
+} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyAc5DhTaxJs85R4DFenkRrxz4GgVQ3dINQ",
+  authDomain: "etsy-shop-helper.firebaseapp.com",
+  projectId: "etsy-shop-helper",
+  storageBucket: "etsy-shop-helper.firebasestorage.app",
+  messagingSenderId: "501818309890",
+  appId: "1:501818309890:web:b575e3faf4f9a8eb1c961b",
+  measurementId: "G-SD9K88E5K7"
+};
+
+// ── OWNER EMAIL — this account is ALWAYS free, never charged ────────────────
+// Replace with your actual email address
+const OWNER_EMAIL = "owner@yourshop.com";
+
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+
+// If already logged in, redirect to app
+onAuthStateChanged(auth, async (user) => {
+  if (user) {
+    const allowed = await checkAccess(user);
+    if (allowed) { window.location.href = 'app.html'; }
+  }
+});
+
+// ── Check if user has access (owner bypass, active trial, or active subscription) ──
+async function checkAccess(user) {
+  if (user.email.toLowerCase() === OWNER_EMAIL.toLowerCase()) return true;
+  const snap = await getDoc(doc(db, "users", user.uid));
+  if (!snap.exists()) return false;
+  const data = snap.data();
+  // Check trial
+  if (data.trialEndsAt) {
+    const trialEnd = data.trialEndsAt.toDate ? data.trialEndsAt.toDate() : new Date(data.trialEndsAt);
+    if (new Date() < trialEnd) return true;
+  }
+  // Check subscription
+  if (data.subscriptionStatus === 'active') return true;
+  return false;
+}
+
+// ── Register ─────────────────────────────────────────────────────────────────
+window.doRegister = async function() {
+  const name = document.getElementById('reg-name').value.trim();
+  const email = document.getElementById('reg-email').value.trim();
+  const password = document.getElementById('reg-password').value;
+  const confirm = document.getElementById('reg-confirm').value;
+  if (!name || !email || !password) { showError('register', 'Please fill in all fields.'); return; }
+  if (password.length < 6) { showError('register', 'Password must be at least 6 characters.'); return; }
+  if (password !== confirm) { showError('register', 'Passwords do not match.'); return; }
+  setBusy('register', true);
+  try {
+    const cred = await createUserWithEmailAndPassword(auth, email, password);
+    await updateProfile(cred.user, { displayName: name });
+
+    // Calculate trial end (14 days from now)
+    const trialEnd = new Date();
+    trialEnd.setDate(trialEnd.getDate() + 14);
+
+    // Create user document in Firestore
+    const isOwner = email.toLowerCase() === OWNER_EMAIL.toLowerCase();
+    await setDoc(doc(db, "users", cred.user.uid), {
+      uid: cred.user.uid,
+      name,
+      email: email.toLowerCase(),
+      isOwner,
+      trialEndsAt: trialEnd.toISOString(),
+      subscriptionStatus: isOwner ? 'owner' : 'trial',
+      stripeCustomerId: null,
+      createdAt: new Date().toISOString()
+    });
+
+    window.location.href = 'app.html';
+  } catch (err) {
+    setBusy('register', false);
+    showError('register', friendlyError(err.code));
+  }
+};
+
+// ── Login ─────────────────────────────────────────────────────────────────────
+window.doLogin = async function() {
+  const email = document.getElementById('login-email').value.trim();
+  const password = document.getElementById('login-password').value;
+  if (!email || !password) { showError('login', 'Please enter your email and password.'); return; }
+  setBusy('login', true);
+  try {
+    const cred = await signInWithEmailAndPassword(auth, email, password);
+    const allowed = await checkAccess(cred.user);
+    if (allowed) {
+      window.location.href = 'app.html';
+    } else {
+      // Trial ended — redirect to billing
+      window.location.href = 'app.html?expired=true';
+    }
+  } catch (err) {
+    setBusy('login', false);
+    showError('login', friendlyError(err.code));
+  }
+};
+
+// ── Reset password ────────────────────────────────────────────────────────────
+window.doReset = async function() {
+  const email = document.getElementById('reset-email').value.trim();
+  if (!email) { showError('reset', 'Enter your email address.'); return; }
+  setBusy('reset', true);
+  try {
+    await sendPasswordResetEmail(auth, email);
+    showSuccess('reset', 'Check your inbox — reset link sent.');
+    setBusy('reset', false);
+  } catch (err) {
+    setBusy('reset', false);
+    showError('reset', friendlyError(err.code));
+  }
+};
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function friendlyError(code) {
+  const map = {
+    'auth/email-already-in-use': 'An account with this email already exists. Sign in instead.',
+    'auth/invalid-email': 'Please enter a valid email address.',
+    'auth/weak-password': 'Password should be at least 6 characters.',
+    'auth/user-not-found': 'No account found with this email.',
+    'auth/wrong-password': 'Incorrect password. Try again or reset it.',
+    'auth/too-many-requests': 'Too many attempts. Please wait a moment and try again.',
+    'auth/network-request-failed': 'Network error. Check your connection and try again.',
+    'auth/invalid-credential': 'Email or password is incorrect.',
+  };
+  return map[code] || 'Something went wrong. Please try again.';
+}
+
+function showError(form, msg) {
+  const el = document.getElementById(form+'-error');
+  if (el) { el.textContent = msg; el.style.display = ''; }
+}
+function showSuccess(form, msg) {
+  const el = document.getElementById(form+'-success');
+  if (el) { el.textContent = msg; el.style.display = ''; }
+  const err = document.getElementById(form+'-error');
+  if (err) err.style.display = 'none';
+}
+function setBusy(form, busy) {
+  const btn = document.getElementById(form+'-btn');
+  if (btn) { btn.disabled = busy; btn.textContent = busy ? 'Please wait…' : btn.dataset.label; }
+}
+
+// ── Read URL param to show correct panel ─────────────────────────────────────
+window.addEventListener('DOMContentLoaded', () => {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get('action') === 'register') showPanel('register');
+  else if (params.get('action') === 'reset') showPanel('reset');
+  else showPanel('login');
+
+  // Set button labels as data attrs for reset
+  ['login','register','reset'].forEach(f => {
+    const btn = document.getElementById(f+'-btn');
+    if (btn) btn.dataset.label = btn.textContent;
+  });
+
+  // Enter key submits
+  document.getElementById('login-password')?.addEventListener('keydown', e => { if(e.key==='Enter') doLogin(); });
+  document.getElementById('reg-confirm')?.addEventListener('keydown', e => { if(e.key==='Enter') doRegister(); });
+  document.getElementById('reset-email')?.addEventListener('keydown', e => { if(e.key==='Enter') doReset(); });
+});
+</script>
+
+<style>
+  :root {
+    --sage: #2c5f2e; --sage-light: #e8f0e8; --cream: #faf8f4;
+    --parchment: #f0ece3; --ink: #1a1712; --muted: #7a7570;
+    --border: #dedad2; --red: #b91c1c; --red-light: #fef2f2;
+    --white: #ffffff;
+    --serif: 'Instrument Serif', serif;
+    --sans: 'Inter', sans-serif;
+    --mono: 'IBM Plex Mono', monospace;
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: var(--sans); background: var(--parchment); color: var(--ink); min-height: 100vh; display: flex; flex-direction: column; }
+
+  .auth-page { flex: 1; display: flex; align-items: center; justify-content: center; padding: 40px 20px; }
+  .auth-box { background: var(--white); border: 1px solid var(--border); border-radius: 16px; width: 100%; max-width: 420px; padding: 40px; box-shadow: 0 4px 24px rgba(0,0,0,.05); }
+
+  .auth-logo { text-align: center; margin-bottom: 28px; }
+  .auth-logo a { font-family: var(--mono); font-size: 13px; font-weight: 500; color: var(--sage); letter-spacing: .08em; text-transform: uppercase; text-decoration: none; }
+  .auth-logo p { font-size: 11px; color: var(--muted); margin-top: 4px; font-family: var(--mono); }
+
+  .auth-panel { display: none; }
+  .auth-panel.active { display: block; }
+
+  h2 { font-family: var(--serif); font-size: 26px; font-weight: 400; margin-bottom: 6px; }
+  .auth-sub { font-size: 13px; color: var(--muted); margin-bottom: 28px; }
+
+  .fg { display: flex; flex-direction: column; gap: 5px; margin-bottom: 14px; }
+  .fg label { font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; font-family: var(--mono); }
+  .fg input {
+    padding: 10px 13px; border: 1.5px solid var(--border); border-radius: 8px;
+    font-family: var(--sans); font-size: 14px; color: var(--ink); background: var(--cream);
+    transition: border-color .15s, box-shadow .15s; width: 100%;
+  }
+  .fg input:focus { outline: none; border-color: var(--sage); box-shadow: 0 0 0 3px rgba(44,95,46,.1); background: var(--white); }
+
+  .btn-submit {
+    width: 100%; padding: 12px; background: var(--sage); color: var(--white);
+    border: none; border-radius: 8px; font-size: 15px; font-weight: 600;
+    cursor: pointer; margin-top: 6px; transition: background .15s;
+    font-family: var(--sans);
+  }
+  .btn-submit:hover { background: #1f4520; }
+  .btn-submit:disabled { opacity: .6; cursor: not-allowed; }
+
+  .auth-error {
+    display: none; background: var(--red-light); color: var(--red);
+    border: 1px solid #fca5a5; border-radius: 8px; padding: 10px 13px;
+    font-size: 13px; margin-bottom: 14px; line-height: 1.5;
+  }
+  .auth-success {
+    display: none; background: var(--sage-light); color: var(--sage);
+    border: 1px solid #b0ccb0; border-radius: 8px; padding: 10px 13px;
+    font-size: 13px; margin-bottom: 14px; line-height: 1.5;
+  }
+
+  .auth-switch { text-align: center; margin-top: 22px; font-size: 13px; color: var(--muted); }
+  .auth-switch a { color: var(--sage); text-decoration: none; font-weight: 500; cursor: pointer; }
+  .auth-switch a:hover { text-decoration: underline; }
+
+  .divider { border: none; border-top: 1px solid var(--border); margin: 22px 0; }
+
+  .trial-badge {
+    background: var(--sage-light); border: 1px solid #b0ccb0;
+    border-radius: 8px; padding: 10px 14px; font-size: 12px;
+    color: var(--sage); text-align: center; margin-bottom: 20px;
+    font-family: var(--mono);
+  }
+
+  .back-home { text-align: center; margin-top: 20px; }
+  .back-home a { font-size: 12px; color: var(--muted); text-decoration: none; }
+  .back-home a:hover { color: var(--ink); }
+</style>
+</head>
+<body>
+
+<div class="auth-page">
+  <div>
+    <div class="auth-box">
+
+      <div class="auth-logo">
+        <a href="index.html">ShopTracker Pro</a>
+        <p>Etsy shop management</p>
+      </div>
+
+      <!-- LOGIN PANEL -->
+      <div class="auth-panel active" id="panel-login">
+        <h2>Welcome back</h2>
+        <p class="auth-sub">Sign in to your shop dashboard</p>
+        <div class="auth-error" id="login-error"></div>
+        <div class="fg"><label>Email</label><input type="email" id="login-email" placeholder="you@email.com" autocomplete="email"></div>
+        <div class="fg"><label>Password</label><input type="password" id="login-password" placeholder="Your password" autocomplete="current-password"></div>
+        <button class="btn-submit" id="login-btn" onclick="doLogin()">Sign in</button>
+        <div class="auth-switch">
+          <a onclick="showPanel('reset')">Forgot password?</a> &nbsp;·&nbsp;
+          No account? <a onclick="showPanel('register')">Sign up free</a>
+        </div>
+      </div>
+
+      <!-- REGISTER PANEL -->
+      <div class="auth-panel" id="panel-register">
+        <div class="trial-badge">✓ 14-day free trial · No credit card needed</div>
+        <h2>Create your account</h2>
+        <p class="auth-sub">Get started in under a minute</p>
+        <div class="auth-error" id="register-error"></div>
+        <div class="fg"><label>Your name</label><input type="text" id="reg-name" placeholder="Jane Smith" autocomplete="name"></div>
+        <div class="fg"><label>Email</label><input type="email" id="reg-email" placeholder="you@email.com" autocomplete="email"></div>
+        <div class="fg"><label>Password</label><input type="password" id="reg-password" placeholder="At least 6 characters" autocomplete="new-password"></div>
+        <div class="fg"><label>Confirm password</label><input type="password" id="reg-confirm" placeholder="Repeat password" autocomplete="new-password"></div>
+        <button class="btn-submit" id="register-btn" onclick="doRegister()">Create account & start trial</button>
+        <div class="auth-switch">Already have an account? <a onclick="showPanel('login')">Sign in</a></div>
+      </div>
+
+      <!-- RESET PANEL -->
+      <div class="auth-panel" id="panel-reset">
+        <h2>Reset password</h2>
+        <p class="auth-sub">We'll send a reset link to your email</p>
+        <div class="auth-error" id="reset-error"></div>
+        <div class="auth-success" id="reset-success"></div>
+        <div class="fg"><label>Email</label><input type="email" id="reset-email" placeholder="you@email.com"></div>
+        <button class="btn-submit" id="reset-btn" onclick="doReset()">Send reset link</button>
+        <div class="auth-switch"><a onclick="showPanel('login')">← Back to sign in</a></div>
+      </div>
+
+    </div>
+
+    <div class="back-home"><a href="index.html">← Back to shoptrackerpro.com</a></div>
+  </div>
+</div>
+
+<script>
+function showPanel(name) {
+  document.querySelectorAll('.auth-panel').forEach(p => p.classList.remove('active'));
+  document.getElementById('panel-'+name).classList.add('active');
+  // Update URL without reload
+  const url = new URL(window.location);
+  url.searchParams.set('action', name === 'login' ? 'login' : name);
+  history.replaceState({}, '', url);
+}
+</script>
+</body>
+</html>
