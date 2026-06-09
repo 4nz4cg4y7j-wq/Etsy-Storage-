@@ -1,0 +1,765 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ShopTracker Pro — Dashboard</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import { getAnalytics, logEvent } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-analytics.js";
+import {
+  getAuth, onAuthStateChanged, signOut
+} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+import {
+  getFirestore, doc, setDoc, getDoc, collection,
+  getDocs, deleteDoc
+} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyAc5DhTaxJs85R4DFenkRrxz4GgVQ3dINQ",
+  authDomain: "etsy-shop-helper.firebaseapp.com",
+  projectId: "etsy-shop-helper",
+  storageBucket: "etsy-shop-helper.firebasestorage.app",
+  messagingSenderId: "501818309890",
+  appId: "1:501818309890:web:b575e3faf4f9a8eb1c961b",
+  measurementId: "G-SD9K88E5K7"
+};
+
+// ── OWNER EMAIL — always free, never charged ──────────────────────────────────
+const OWNER_EMAIL = "owner@yourshop.com"; // ← CHANGE THIS to your email
+
+const app = initializeApp(firebaseConfig);
+const analytics = getAnalytics(app);
+const auth = getAuth(app);
+const db = getFirestore(app);
+
+// ── Auth guard — runs before anything else ────────────────────────────────────
+onAuthStateChanged(auth, async (user) => {
+  if (!user) {
+    window.location.href = 'auth.html';
+    return;
+  }
+
+  // Get user profile from Firestore
+  const userSnap = await getDoc(doc(db, "users", user.uid));
+  if (!userSnap.exists()) {
+    window.location.href = 'auth.html';
+    return;
+  }
+  const userData = userSnap.data();
+  const isOwner = user.email.toLowerCase() === OWNER_EMAIL.toLowerCase() || userData.isOwner === true;
+
+  // Check access
+  let hasAccess = isOwner;
+  let trialDaysLeft = 0;
+  let trialExpired = false;
+
+  if (!isOwner) {
+    if (userData.trialEndsAt) {
+      const trialEnd = new Date(userData.trialEndsAt);
+      const now = new Date();
+      trialDaysLeft = Math.ceil((trialEnd - now) / (1000*60*60*24));
+      if (now < trialEnd) hasAccess = true;
+      else trialExpired = true;
+    }
+    if (userData.subscriptionStatus === 'active') { hasAccess = true; trialExpired = false; }
+  }
+
+  if (!hasAccess) {
+    // Show paywall
+    document.getElementById('app-shell').style.display = 'none';
+    document.getElementById('paywall').style.display = 'flex';
+    document.getElementById('paywall-name').textContent = userData.name || 'there';
+    window.__signOut = () => signOut(auth).then(() => window.location.href = 'auth.html');
+    return;
+  }
+
+  // ── Access granted — boot the app ──────────────────────────────────────────
+  window.__currentUser = user;
+  window.__userData = userData;
+  window.__isOwner = isOwner;
+  window.__db = db;
+  window.__auth = auth;
+  window.__signOut = () => signOut(auth).then(() => window.location.href = 'auth.html');
+
+  // Set sidebar user info
+  document.getElementById('user-name').textContent = userData.name || user.email;
+  document.getElementById('user-email').textContent = user.email;
+  if (isOwner) {
+    document.getElementById('user-badge').textContent = 'Owner';
+    document.getElementById('user-badge').style.background = '#2c5f2e';
+    document.getElementById('user-badge').style.color = '#fff';
+  } else if (trialDaysLeft > 0) {
+    document.getElementById('user-badge').textContent = trialDaysLeft + 'd trial left';
+    document.getElementById('user-badge').style.background = '#fef3e2';
+    document.getElementById('user-badge').style.color = '#92580a';
+  } else {
+    document.getElementById('user-badge').textContent = 'Pro';
+    document.getElementById('user-badge').style.background = '#e8f0e8';
+    document.getElementById('user-badge').style.color = '#1a3d1b';
+  }
+
+  // All data is scoped to this user: /users/{uid}/data/...
+  const SHOP = user.uid;
+
+  async function fsGet(colName) {
+    const snap = await getDocs(collection(db, "users", SHOP, colName));
+    return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  }
+  async function fsSet(colName, id, data) {
+    await setDoc(doc(db, "users", SHOP, colName, id), data, { merge: true });
+  }
+  async function fsDel(colName, id) {
+    await deleteDoc(doc(db, "users", SHOP, colName, id));
+  }
+  async function fsMeta(key, data) {
+    await setDoc(doc(db, "users", SHOP, "_meta", key), data, { merge: true });
+  }
+  async function fsMetaGet(key, fallback) {
+    const snap = await getDoc(doc(db, "users", SHOP, "_meta", key));
+    return snap.exists() ? snap.data() : fallback;
+  }
+
+  window.__fb = { fsGet, fsSet, fsDel, fsMeta, fsMetaGet, analytics, logEvent };
+
+  // Load all user data
+  try {
+    document.getElementById('loading-screen').style.display = 'flex';
+    document.getElementById('app-shell').style.display = 'none';
+
+    const [products, orders, productColors, productTypes, storageLocations,
+           fillSteps, txs, seqMeta, etsyMeta] = await Promise.all([
+      fsGet("products"),
+      fsGet("orders"),
+      fsGet("productColors"),
+      fsGet("productTypes"),
+      fsGet("storageLocations"),
+      fsGet("fillSteps"),
+      fsGet("transactions"),
+      fsMetaGet("seq", { p: 1000, o: 5000 }),
+      fsMetaGet("etsyCfg", { key: "", shop: "" })
+    ]);
+
+    window._products = products;
+    window._orders = orders;
+    window._productColors = productColors.length ? productColors : [
+      {id:'pc1',name:'Lavender',hex:'#c8a8e9'},{id:'pc2',name:'Rose',hex:'#f4a7b9'},
+      {id:'pc3',name:'Ocean Blue',hex:'#7ec8e3'},{id:'pc4',name:'Sage',hex:'#a8c5a0'},{id:'pc5',name:'Honey',hex:'#f0c060'}
+    ];
+    window._productTypes = productTypes;
+    window._storageLocations = storageLocations;
+    window._fillSteps = fillSteps.length ? fillSteps : [
+      {id:'fs1',name:'Order received',inst:''},{id:'fs2',name:'Gather items',inst:'Check storage location'},
+      {id:'fs3',name:'Wrap & pack',inst:'Use branded tissue paper'},{id:'fs4',name:'Print shipping label',inst:''},
+      {id:'fs5',name:'Seal & label box',inst:''},{id:'fs6',name:'Drop off at post office',inst:'Get receipt'},
+      {id:'fs7',name:'In transit',inst:''},{id:'fs8',name:'Delivered',inst:''}
+    ];
+    window._txs = txs;
+    window._seq = seqMeta;
+    window._etsyCfg = etsyMeta;
+
+    // Seed defaults for new users
+    if (!productColors.length) for (const c of window._productColors) await fsSet("productColors", c.id, c);
+    if (!fillSteps.length) for (const s of window._fillSteps) await fsSet("fillSteps", s.id, s);
+
+    window.__fbReady = true;
+    document.getElementById('loading-screen').style.display = 'none';
+    document.getElementById('app-shell').style.display = 'grid';
+    logEvent(analytics, 'app_open', { uid: SHOP });
+    renderDash();
+  } catch (err) {
+    console.error("Boot error:", err);
+    document.getElementById('loading-screen').innerHTML = `
+      <div style="text-align:center;padding:40px">
+        <div style="font-size:32px;margin-bottom:16px">⚠</div>
+        <div style="font-size:16px;font-weight:600;margin-bottom:8px">Could not load your data</div>
+        <div style="font-size:13px;color:#6b6860;margin-bottom:20px">${err.message}</div>
+        <button onclick="location.reload()" style="padding:8px 20px;background:#2c5f2e;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px">Try again</button>
+      </div>`;
+  }
+});
+</script>
+
+<style>
+:root{--bg:#f7f6f3;--surface:#fff;--border:#e2e0da;--border-strong:#c8c5bc;--text:#1a1917;--muted:#6b6860;--hint:#9e9b93;--accent:#2c5f2e;--accent-light:#e8f0e8;--accent-text:#1a3d1b;--amber:#92580a;--amber-light:#fef3e2;--amber-text:#5c3607;--blue:#1a4a8a;--blue-light:#e8f0fb;--blue-text:#0d2e5a;--red:#8a2020;--red-light:#fbe8e8;--red-text:#5a0d0d;--purple:#5a3a8a;--purple-light:#f0ebfb;--purple-text:#3a2060;--mono:'IBM Plex Mono',monospace;--sans:'IBM Plex Sans',sans-serif;--r:6px;--rl:10px}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--sans);background:var(--bg);color:var(--text);font-size:14px;line-height:1.5}
+
+/* LOADING */
+#loading-screen{position:fixed;inset:0;background:var(--bg);display:flex;align-items:center;justify-content:center;z-index:999;flex-direction:column;gap:14px}
+.spinner{width:32px;height:32px;border:3px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* PAYWALL */
+#paywall{position:fixed;inset:0;background:var(--bg);display:none;align-items:center;justify-content:center;z-index:998;padding:24px}
+.paywall-box{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:40px;max-width:460px;width:100%;text-align:center}
+.paywall-icon{font-size:40px;margin-bottom:16px}
+.paywall-box h2{font-size:22px;font-weight:600;margin-bottom:8px}
+.paywall-box p{font-size:14px;color:var(--muted);margin-bottom:24px;line-height:1.6}
+
+/* APP SHELL */
+#app-shell{display:none;grid-template-columns:230px 1fr;min-height:100vh}
+.sidebar{background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;position:sticky;top:0;height:100vh;overflow-y:auto}
+.logo{padding:16px 16px 12px;border-bottom:1px solid var(--border)}
+.logo h1{font-size:13px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--accent);font-family:var(--mono)}
+.logo p{font-size:11px;color:var(--hint);margin-top:2px}
+.user-card{padding:12px 14px;border-bottom:1px solid var(--border);display:flex;flex-direction:column;gap:3px}
+.user-name{font-size:13px;font-weight:600;color:var(--text)}
+.user-email{font-size:11px;color:var(--muted);font-family:var(--mono)}
+.user-badge{display:inline-block;font-size:10px;font-weight:600;padding:2px 8px;border-radius:20px;font-family:var(--mono);margin-top:4px;letter-spacing:.04em}
+.nav{padding:10px 8px;flex:1}
+.nav-item{display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:var(--r);cursor:pointer;font-size:13px;color:var(--muted);transition:all .15s;margin-bottom:2px;border:none;background:none;width:100%;text-align:left}
+.nav-item:hover{background:var(--bg);color:var(--text)}
+.nav-item.active{background:var(--accent-light);color:var(--accent-text);font-weight:500}
+.nav-section{font-size:10px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--hint);padding:10px 10px 3px;font-family:var(--mono)}
+.signout-btn{margin:8px;padding:8px 12px;border-radius:var(--r);border:1px solid var(--border);background:var(--bg);color:var(--muted);font-size:12px;cursor:pointer;width:calc(100% - 16px);text-align:left;font-family:var(--sans)}
+.signout-btn:hover{background:var(--red-light);color:var(--red-text);border-color:#d9a0a0}
+
+.main{overflow-y:auto;max-height:100vh}
+.page{display:none;padding:26px 30px}
+.page.active{display:block}
+.ph{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:22px}
+.pt{font-size:20px;font-weight:600}
+.ps{font-size:13px;color:var(--muted);margin-top:3px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:22px}
+.stat{background:var(--surface);border:1px solid var(--border);border-radius:var(--rl);padding:12px 14px}
+.stat-l{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;font-family:var(--mono)}
+.stat-v{font-size:24px;font-weight:600;margin-top:3px;font-family:var(--mono)}
+.stat-v.g{color:var(--accent)}.stat-v.a{color:var(--amber)}.stat-v.b{color:var(--blue)}.stat-v.r{color:var(--red)}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:7px 13px;border-radius:var(--r);border:1px solid var(--border-strong);background:var(--surface);color:var(--text);font-size:13px;font-family:var(--sans);cursor:pointer;transition:all .15s;font-weight:500}
+.btn:hover{background:var(--bg)}
+.btn-p{background:var(--accent);color:#fff;border-color:var(--accent)}.btn-p:hover{background:var(--accent-text)}
+.btn-a{background:var(--amber-light);color:var(--amber-text);border-color:#d4b07a}
+.btn-d{background:var(--red-light);color:var(--red-text);border-color:#d9a0a0}
+.btn-b{background:var(--blue-light);color:var(--blue-text);border-color:#90b4e0}
+.btn-sm{padding:4px 9px;font-size:12px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--rl);overflow:hidden;margin-bottom:18px}
+.card-hdr{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.card-title{font-size:14px;font-weight:600}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{background:var(--bg);padding:8px 13px;text-align:left;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);border-bottom:1px solid var(--border);font-family:var(--mono)}
+td{padding:9px 13px;border-bottom:1px solid var(--border);vertical-align:middle}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:#fafaf8}
+.erow td{text-align:center;color:var(--hint);padding:24px;font-style:italic}
+.badge{display:inline-flex;align-items:center;gap:3px;font-size:11px;font-weight:500;padding:2px 7px;border-radius:20px;white-space:nowrap;font-family:var(--mono)}
+.bg{background:var(--accent-light);color:var(--accent-text)}.ba{background:var(--amber-light);color:var(--amber-text)}.bb{background:var(--blue-light);color:var(--blue-text)}.br{background:var(--red-light);color:var(--red-text)}.bgr{background:#f0ede6;color:#5a5750}
+.fg{display:flex;flex-direction:column;gap:4px}
+.fg label{font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;font-family:var(--mono)}
+input,select,textarea{font-family:var(--sans);font-size:13px;padding:7px 10px;border:1px solid var(--border-strong);border-radius:var(--r);background:var(--surface);color:var(--text);width:100%}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(44,95,46,.1)}
+textarea{resize:vertical;min-height:65px}
+.frow{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:11px}
+.fsec{background:var(--surface);border:1px solid var(--border);border-radius:var(--rl);padding:18px;margin-bottom:14px}
+.fsec-t{font-size:13px;font-weight:600;margin-bottom:13px;padding-bottom:9px;border-bottom:1px solid var(--border)}
+.pnum{font-family:var(--mono);font-size:11px;background:var(--bg);border:1px solid var(--border);padding:2px 6px;border-radius:4px;color:var(--muted)}
+.modal-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:100;align-items:flex-start;justify-content:center;padding:40px 20px;overflow-y:auto}
+.modal-bg.open{display:flex}
+.modal{background:var(--surface);border-radius:var(--rl);border:1px solid var(--border);width:100%;max-width:660px}
+.modal-hdr{padding:16px 20px 12px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.modal-title{font-size:15px;font-weight:600}
+.modal-body{padding:18px 20px}
+.modal-foot{padding:12px 20px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:8px}
+.xbtn{background:none;border:none;cursor:pointer;font-size:20px;color:var(--muted);line-height:1;padding:2px}
+.fill-step{border:1px solid var(--border);border-radius:var(--r);margin-bottom:8px;overflow:hidden}
+.fill-step-hdr{display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--bg);cursor:pointer}
+.fill-step-hdr.done{background:var(--accent-light)}
+.fill-step-num{width:24px;height:24px;border-radius:50%;border:2px solid var(--border);display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;font-family:var(--mono);flex-shrink:0;color:var(--muted)}
+.fill-step-hdr.done .fill-step-num{background:var(--accent);color:#fff}
+.fill-step-name{font-size:13px;font-weight:500;flex:1}
+.fill-step-body{padding:12px 14px;border-top:1px solid var(--border);display:none}
+.fill-step-body.open{display:block}
+.filters{display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
+.chip{padding:4px 11px;border-radius:20px;border:1px solid var(--border-strong);background:var(--surface);font-size:12px;cursor:pointer;color:var(--muted);transition:all .15s}
+.chip:hover{background:var(--bg)}
+.chip.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+.si{padding:6px 10px;border:1px solid var(--border-strong);border-radius:20px;font-size:13px;width:200px}
+.notif{position:fixed;bottom:22px;right:22px;background:var(--text);color:#fff;padding:9px 16px;border-radius:var(--r);font-size:13px;z-index:999;opacity:0;transition:opacity .2s;pointer-events:none}
+.notif.show{opacity:1}
+.saving{position:fixed;top:12px;right:16px;font-size:12px;font-family:var(--mono);color:var(--muted);background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:3px 9px;opacity:0;transition:opacity .2s;z-index:200}
+.saving.show{opacity:1}
+.progress-bar{height:6px;background:var(--border);border-radius:3px;overflow:hidden;width:100px;display:inline-block;vertical-align:middle}
+.progress-fill{height:100%;border-radius:3px;transition:width .3s}
+.etsy-banner{background:var(--amber-light);border:1px solid #d4b07a;border-radius:var(--r);padding:12px 16px;margin-bottom:16px;font-size:13px;color:var(--amber-text)}
+.money-in{color:var(--accent);font-weight:500}
+.money-out{color:var(--red);font-weight:500}
+</style>
+</head>
+<body>
+
+<!-- LOADING -->
+<div id="loading-screen">
+  <div class="spinner"></div>
+  <div style="font-size:13px;color:var(--muted);font-family:'IBM Plex Mono',monospace">Loading your shop…</div>
+</div>
+
+<!-- PAYWALL -->
+<div id="paywall">
+  <div class="paywall-box">
+    <div class="paywall-icon">🔒</div>
+    <h2>Your trial has ended</h2>
+    <p>Hey <strong id="paywall-name"></strong>, your 14-day free trial is up. Subscribe to keep access to all your products, orders, and financial data.</p>
+    <div style="background:#f0ece3;border-radius:10px;padding:20px;margin-bottom:24px;">
+      <div style="font-size:28px;font-weight:700;color:#1a1712">$14.99<span style="font-size:14px;font-weight:400;color:#7a7570">/month</span></div>
+      <div style="font-size:12px;color:#7a7570;margin-top:4px">Cancel anytime · Your data is safe</div>
+    </div>
+    <button onclick="startCheckout()" style="width:100%;padding:14px;background:#2c5f2e;color:#fff;border:none;border-radius:8px;font-size:15px;font-weight:600;cursor:pointer;margin-bottom:12px">Subscribe with Stripe →</button>
+    <button onclick="window.__signOut()" style="width:100%;padding:10px;background:transparent;color:#7a7570;border:1px solid #dedad2;border-radius:8px;font-size:13px;cursor:pointer">Sign out</button>
+  </div>
+</div>
+
+<!-- APP SHELL -->
+<div id="app-shell">
+<aside class="sidebar">
+  <div class="logo">
+    <h1>ShopTracker Pro</h1>
+    <p>Inventory · Orders · Finance</p>
+  </div>
+  <div class="user-card">
+    <div class="user-name" id="user-name">Loading…</div>
+    <div class="user-email" id="user-email"></div>
+    <span class="user-badge" id="user-badge">Pro</span>
+  </div>
+  <nav class="nav">
+    <div class="nav-section">Overview</div>
+    <button class="nav-item active" onclick="go('dashboard')">⊞ Dashboard</button>
+    <div class="nav-section">Inventory</div>
+    <button class="nav-item" onclick="go('products')">◻ Products</button>
+    <button class="nav-item" onclick="go('storage')">▦ Storage locations</button>
+    <div class="nav-section">Orders</div>
+    <button class="nav-item" onclick="go('orders')">◈ All orders</button>
+    <button class="nav-item" onclick="go('import-order')">↓ Import / Etsy sync</button>
+    <div class="nav-section">Finance</div>
+    <button class="nav-item" onclick="go('finance')">$ Money in/out</button>
+    <button class="nav-item" onclick="go('reports')">⊡ Reports</button>
+    <div class="nav-section">Settings</div>
+    <button class="nav-item" onclick="go('order-steps')">✓ Order steps</button>
+  </nav>
+  <button class="signout-btn" onclick="window.__signOut()">← Sign out</button>
+</aside>
+<main class="main">
+
+<!-- DASHBOARD -->
+<div class="page active" id="page-dashboard">
+  <div class="ph"><div><div class="pt">Dashboard</div><div class="ps">Your shop at a glance</div></div></div>
+  <div class="stats" id="d-stats"></div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+    <div class="card"><div class="card-hdr"><span class="card-title">Recent orders</span><button class="btn btn-sm" onclick="go('orders')">View all</button></div><table><thead><tr><th>Order</th><th>Customer</th><th>Progress</th><th>Etsy</th></tr></thead><tbody id="d-orders"></tbody></table></div>
+    <div class="card"><div class="card-hdr"><span class="card-title">Products needing videos</span></div><table><thead><tr><th>Product</th><th>Missing</th></tr></thead><tbody id="d-videos"></tbody></table></div>
+  </div>
+  <div class="card"><div class="card-hdr"><span class="card-title">Finance summary (this month)</span><button class="btn btn-sm btn-b" onclick="go('reports')">Reports</button></div><div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;padding:14px;" id="d-finance"></div></div>
+  <div class="card"><div class="card-hdr"><span class="card-title">Product types</span><button class="btn btn-sm" onclick="go('products')">Manage</button></div><table><thead><tr><th>Type</th><th>Videos</th><th>Units</th><th>Price</th></tr></thead><tbody id="d-types"></tbody></table></div>
+</div>
+
+<!-- PRODUCTS -->
+<div class="page" id="page-products">
+  <div class="ph">
+    <div><div class="pt">Products</div><div class="ps">Manage inventory — videos required before adding units</div></div>
+    <div style="display:flex;gap:8px;">
+      <button class="btn" id="toggle-color-btn" onclick="togglePanel('color')">◉ Colors</button>
+      <button class="btn" id="toggle-type-btn" onclick="togglePanel('type')">+ New product type</button>
+      <button class="btn btn-p" id="toggle-add-btn" onclick="togglePanel('add')">+ Add products</button>
+    </div>
+  </div>
+  <div id="panel-color" style="display:none;margin-bottom:16px;"></div>
+  <div id="panel-type" style="display:none;margin-bottom:16px;"></div>
+  <div id="panel-add" style="display:none;margin-bottom:16px;"></div>
+  <div class="filters">
+    <input class="si" type="text" placeholder="Search..." oninput="renderProducts()" id="prod-search">
+    <span class="chip active" onclick="setPF('all',this)">All</span>
+    <span class="chip" onclick="setPF('ready',this)">Ready</span>
+    <span class="chip" onclick="setPF('no-video',this)">Needs videos</span>
+    <span class="chip" onclick="setPF('etsy',this)">On Etsy</span>
+    <span id="color-filter-chips"></span>
+    <span id="type-filter-chips2"></span>
+  </div>
+  <div class="card"><table><thead><tr><th>Prod #</th><th>Color</th><th>Type</th><th>Name</th><th>Videos</th><th>Units</th><th>Price</th><th>Est. ship</th><th>Storage</th><th>On Etsy</th><th></th></tr></thead><tbody id="prod-table"></tbody></table></div>
+  <div style="margin-top:8px;"><div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.07em;font-family:var(--mono);margin-bottom:8px;">Product types</div><div id="pt-type-list" style="display:flex;flex-direction:column;gap:6px;"></div><div id="pt-no-types" style="font-size:13px;color:var(--hint);padding:8px 2px;display:none;">No product types yet.</div></div>
+</div>
+
+<!-- ORDERS -->
+<div class="page" id="page-orders">
+  <div class="ph"><div><div class="pt">Orders</div><div class="ps">Track every order through your fulfillment workflow</div></div><button class="btn" onclick="go('import-order')">↓ Import order</button></div>
+  <div class="filters">
+    <input class="si" type="text" placeholder="Search..." oninput="renderOrders()" id="ord-search">
+    <span class="chip active" onclick="setOF('all',this)">All</span>
+    <span class="chip" onclick="setOF('open',this)">Open</span>
+    <span class="chip" onclick="setOF('done',this)">Complete</span>
+  </div>
+  <div class="card"><table><thead><tr><th>Order #</th><th>Etsy #</th><th>Customer</th><th>Items</th><th>Total</th><th>Fill progress</th><th>Ship stage</th><th></th></tr></thead><tbody id="ord-table"></tbody></table></div>
+</div>
+
+<!-- IMPORT -->
+<div class="page" id="page-import-order">
+  <div class="ph"><div><div class="pt">Import / Etsy sync</div><div class="ps">Manually enter an Etsy order</div></div></div>
+  <div class="etsy-banner"><strong>Etsy API:</strong> Requires OAuth developer approval. Save your API key below and use manual import in the meantime. <a href="https://www.etsy.com/developers/register" target="_blank" style="color:var(--amber-text);text-decoration:underline;">Get an API key →</a></div>
+  <div class="fsec"><div class="fsec-t">Etsy API connection</div><div class="frow"><div class="fg"><label>Etsy API key</label><input id="etsy-key" type="password" placeholder="Paste your Etsy API key"></div><div class="fg"><label>Shop name</label><input id="etsy-shop" placeholder="e.g. MyShopName"></div><div class="fg"><label style="opacity:0">.</label><button class="btn btn-a" onclick="saveEtsyConfig()">Save</button></div></div><div id="etsy-status" style="margin-top:10px;font-size:13px;"></div></div>
+  <div class="fsec"><div class="fsec-t">Manual order entry</div>
+    <div style="display:flex;flex-direction:column;gap:11px;">
+      <div class="frow"><div class="fg"><label>Etsy order #</label><input id="io-enum" placeholder="e.g. 3456789012"></div><div class="fg"><label>Customer name</label><input id="io-cust" placeholder="Full name"></div><div class="fg"><label>Order date</label><input type="date" id="io-date"></div></div>
+      <div class="frow"><div class="fg"><label>Email</label><input id="io-email" placeholder="customer@email.com"></div><div class="fg"><label>Ship to</label><input id="io-addr" placeholder="Street, City, State, ZIP"></div><div class="fg"><label>Order total ($)</label><input type="number" id="io-total" placeholder="0.00" step="0.01"></div></div>
+      <div><div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;font-family:var(--mono);margin-bottom:8px;">Items ordered</div><div id="io-items"></div><button class="btn btn-sm" onclick="addIOItem()" style="margin-top:6px;">+ Add item</button></div>
+      <div class="frow"><div class="fg"><label>Tracking #</label><input id="io-track" placeholder="Carrier tracking number"></div><div class="fg"><label>Carrier</label><select id="io-carrier"><option value="">— Select —</option><option>USPS</option><option>UPS</option><option>FedEx</option><option>DHL</option></select></div><div class="fg"><label>Notes</label><input id="io-notes" placeholder="Any notes"></div></div>
+    </div>
+    <button class="btn btn-p" style="margin-top:14px;" onclick="importOrder()">Import & start tracking</button>
+  </div>
+</div>
+
+<!-- FINANCE -->
+<div class="page" id="page-finance">
+  <div class="ph"><div><div class="pt">Money in / out</div><div class="ps">Track all income and expenses</div></div><button class="btn btn-p" onclick="openAddTx()">+ Add transaction</button></div>
+  <div class="stats" id="fin-stats"></div>
+  <div class="filters">
+    <input class="si" type="text" placeholder="Search..." oninput="renderFinance()" id="fin-search">
+    <span class="chip active" onclick="setFF('all',this)">All</span>
+    <span class="chip" onclick="setFF('income',this)">Income</span>
+    <span class="chip" onclick="setFF('expense',this)">Expenses</span>
+  </div>
+  <div class="card"><table><thead><tr><th>Date</th><th>Description</th><th>Category</th><th>Type</th><th>Amount</th><th></th></tr></thead><tbody id="fin-table"></tbody></table></div>
+</div>
+
+<!-- REPORTS -->
+<div class="page" id="page-reports">
+  <div class="ph"><div><div class="pt">Reports</div><div class="ps">Export your data for any date range</div></div></div>
+  <div class="fsec"><div class="fsec-t">Date range</div>
+    <div class="frow">
+      <div class="fg"><label>From</label><input type="date" id="rep-from"></div>
+      <div class="fg"><label>To</label><input type="date" id="rep-to"></div>
+      <div class="fg"><label>Include</label>
+        <div style="display:flex;flex-direction:column;gap:6px;margin-top:4px;">
+          <label style="font-size:13px;font-family:var(--sans);font-weight:400;display:flex;align-items:center;gap:6px;"><input type="checkbox" id="rep-orders" checked style="width:auto;"> Orders</label>
+          <label style="font-size:13px;font-family:var(--sans);font-weight:400;display:flex;align-items:center;gap:6px;"><input type="checkbox" id="rep-finance" checked style="width:auto;"> Finance</label>
+          <label style="font-size:13px;font-family:var(--sans);font-weight:400;display:flex;align-items:center;gap:6px;"><input type="checkbox" id="rep-products" checked style="width:auto;"> Inventory</label>
+        </div>
+      </div>
+    </div>
+    <button class="btn btn-p" style="margin-top:14px;" onclick="generateReport()">Export report data (JSON)</button>
+    <div id="rep-status" style="margin-top:10px;font-size:13px;color:var(--muted);"></div>
+  </div>
+</div>
+
+<!-- STORAGE -->
+<div class="page" id="page-storage">
+  <div class="ph"><div><div class="pt">Storage locations</div><div class="ps">Define where products are stored</div></div></div>
+  <div class="card" style="max-width:540px;"><div class="card-hdr"><span class="card-title">Add location</span></div><div style="padding:14px;"><div class="frow" style="align-items:end;"><div class="fg"><label>Location name</label><input id="sl-name" placeholder="e.g. Shelf A, Box 3"></div><div class="fg"><label>Description</label><input id="sl-desc" placeholder="Optional"></div><div class="fg"><label style="opacity:0">.</label><button class="btn btn-p" onclick="addStorageLoc()">Add</button></div></div></div></div>
+  <div class="card" style="max-width:540px;"><div class="card-hdr"><span class="card-title">Your storage locations</span></div><div id="sl-list" style="padding:12px;display:flex;flex-direction:column;gap:7px;"></div></div>
+</div>
+
+<!-- ORDER STEPS -->
+<div class="page" id="page-order-steps">
+  <div class="ph"><div><div class="pt">Order steps</div><div class="ps">Define every step an order goes through</div></div></div>
+  <div class="card" style="max-width:560px;"><div class="card-hdr"><span class="card-title">Add step</span></div><div style="padding:14px;"><div class="frow"><div class="fg"><label>Step name</label><input id="fs-name" placeholder="e.g. Print packing slip"></div><div class="fg"><label>Instructions</label><input id="fs-inst" placeholder="Optional details"></div></div><button class="btn btn-p" style="margin-top:11px;" onclick="addFillStep()">Add step</button></div></div>
+  <div class="card" style="max-width:560px;"><div class="card-hdr"><span class="card-title">Your steps (drag to reorder)</span></div><div id="fs-list" style="padding:10px;display:flex;flex-direction:column;gap:7px;"></div></div>
+</div>
+
+</main>
+</div>
+
+<!-- PRODUCT MODAL -->
+<div class="modal-bg" id="prod-modal"><div class="modal"><div class="modal-hdr"><span class="modal-title" id="pm-title">Product</span><button class="xbtn" onclick="CM('prod-modal')">×</button></div><div class="modal-body" id="pm-body"></div><div class="modal-foot"><button class="btn btn-sm btn-d" id="pm-del">Delete</button><button class="btn btn-sm btn-p" id="pm-save">Save</button><button class="btn btn-sm" onclick="CM('prod-modal')">Cancel</button></div></div></div>
+
+<!-- ORDER MODAL -->
+<div class="modal-bg" id="ord-modal"><div class="modal" style="max-width:720px;"><div class="modal-hdr"><span class="modal-title" id="om-title">Order</span><button class="xbtn" onclick="CM('ord-modal')">×</button></div><div class="modal-body" id="om-body"></div><div class="modal-foot"><button class="btn btn-sm" onclick="CM('ord-modal')">Close</button></div></div></div>
+
+<!-- TRANSACTION MODAL -->
+<div class="modal-bg" id="tx-modal"><div class="modal" style="max-width:500px;"><div class="modal-hdr"><span class="modal-title">Add transaction</span><button class="xbtn" onclick="CM('tx-modal')">×</button></div><div class="modal-body"><div style="display:flex;flex-direction:column;gap:11px;"><div class="frow"><div class="fg"><label>Date</label><input type="date" id="tx-date"></div><div class="fg"><label>Type</label><select id="tx-type"><option value="income">Income</option><option value="expense">Expense</option></select></div></div><div class="fg"><label>Description</label><input id="tx-desc" placeholder="e.g. Etsy sale, Packaging supplies"></div><div class="frow"><div class="fg"><label>Category</label><select id="tx-cat"><option>Etsy sale</option><option>Other income</option><option>Supplies</option><option>Packaging</option><option>Shipping cost</option><option>Platform fees</option><option>Equipment</option><option>Marketing</option><option>Other expense</option></select></div><div class="fg"><label>Amount ($)</label><input type="number" id="tx-amt" placeholder="0.00" step="0.01" min="0"></div></div><div class="fg"><label>Linked order #</label><input id="tx-order" placeholder="Optional"></div></div></div><div class="modal-foot"><button class="btn btn-p" onclick="saveTx()">Add transaction</button><button class="btn btn-sm" onclick="CM('tx-modal')">Cancel</button></div></div></div>
+
+<div class="notif" id="notif"></div>
+<div class="saving" id="saving">Saving…</div>
+
+<script>
+// ── Stripe checkout placeholder ───────────────────────────────────────────────
+// Replace STRIPE_PRICE_ID with your actual Stripe Price ID
+// You'll also need a backend endpoint (Firebase Function) to create a checkout session
+function startCheckout() {
+  // TODO: Call your Firebase Function to create Stripe checkout session
+  // Example with Firebase Functions:
+  // fetch('https://YOUR_REGION-YOUR_PROJECT.cloudfunctions.net/createCheckoutSession', {
+  //   method: 'POST',
+  //   headers: {'Content-Type':'application/json'},
+  //   body: JSON.stringify({ uid: window.__currentUser.uid, email: window.__currentUser.email })
+  // }).then(r=>r.json()).then(d => window.location.href = d.url);
+  alert('Stripe checkout coming soon!\n\nTo activate:\n1. Create a Stripe account at stripe.com\n2. Get your Price ID\n3. Set up a Firebase Function for checkout sessions\n4. Replace this alert with the fetch() call above.');
+}
+
+// ── Wait for Firebase module to set globals ───────────────────────────────────
+function waitForFb(fn) {
+  if (window.__fbReady) { fn(); }
+  else { setTimeout(() => waitForFb(fn), 80); }
+}
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let products=[], orders=[], productColors=[], productTypes=[],
+    storageLocations=[], fillSteps=[], txs=[], seq={p:1000,o:5000}, etsyCfg={key:'',shop:''};
+let pf='all', of='all', ff='all', editPId=null, ioItemC=0, dragId=null;
+let _typeSuggested=0, typeColorIds=[], apColorIds=[];
+
+function syncFromGlobals() {
+  if (!window.__fbReady) return;
+  products=window._products||[]; orders=window._orders||[];
+  productColors=window._productColors||[]; productTypes=window._productTypes||[];
+  storageLocations=window._storageLocations||[]; fillSteps=window._fillSteps||[];
+  txs=window._txs||[]; seq=window._seq||{p:1000,o:5000}; etsyCfg=window._etsyCfg||{key:'',shop:''};
+}
+
+function showSaving(){const e=document.getElementById('saving');e.classList.add('show');clearTimeout(window._sv);window._sv=setTimeout(()=>e.classList.remove('show'),1200)}
+async function saveItem(col,id,data){showSaving();try{await window.__fb.fsSet(col,id,data)}catch(e){notify('⚠ Save failed');console.error(e)}}
+async function delItem(col,id){showSaving();try{await window.__fb.fsDel(col,id)}catch(e){notify('⚠ Delete failed');console.error(e)}}
+async function saveMeta(key,data){try{await window.__fb.fsMeta(key,data)}catch(e){console.error(e)}}
+function uid(){return Date.now().toString(36)+Math.random().toString(36).slice(2)}
+function notify(m){const e=document.getElementById('notif');e.textContent=m;e.classList.add('show');setTimeout(()=>e.classList.remove('show'),2600)}
+function OM(id){document.getElementById(id).classList.add('open')}
+function CM(id){document.getElementById(id).classList.remove('open')}
+async function nProd(){seq.p++;await saveMeta("seq",seq);window._seq=seq;return'P-'+seq.p}
+async function nOrd(){seq.o++;await saveMeta("seq",seq);window._seq=seq;return'O-'+seq.o}
+
+function go(id){
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
+  document.getElementById('page-'+id).classList.add('active');
+  document.querySelectorAll('.nav-item').forEach(b=>{if((b.getAttribute('onclick')||'').includes("'"+id+"'"))b.classList.add('active')});
+  syncFromGlobals();
+  const m={dashboard:renderDash,products:renderProducts,storage:renderStorage,'order-steps':renderFillSteps,orders:renderOrders,finance:renderFinance,'import-order':setupImport,reports:setupReports};
+  if(m[id])m[id]();
+}
+
+// ── Shipping estimates ────────────────────────────────────────────────────────
+function estShipping(w,m){
+  w=parseFloat(w)||0;
+  const r={first_class:w<=15.9?(w<=4?4.50:w<=8?5.30:w<=12?6.20:7.10):null,priority:w<=70?(w<=16?9.35:w<=32?13.75:w<=48?17.90:21.50):null,ground_adv:w<=70?(w<=4?5.00:w<=8?5.85:w<=16?7.20:w<=32?10.40:13.80):null,flat_rate_sm:10.40,flat_rate_med:16.10};
+  const v=r[m];if(v===null||v===undefined)return{rate:null,note:'Weight exceeds limit'};
+  return{rate:v,note:'Estimated USPS rate'};
+}
+function calcSuggestedPrice(mat,lab,oth,mar,wt,mth,incShip){
+  const c=(parseFloat(mat)||0)+(parseFloat(lab)||0)+(parseFloat(oth)||0);
+  if(!c&&!wt)return null;
+  const{rate}=estShipping(wt,mth);const sc=rate||0;
+  const cm=c*(1+(parseFloat(mar)||30)/100);
+  const s=incShip?(cm+sc)/0.935:cm/0.935;
+  return{totalCost:c,shipCost:sc,suggested:Math.ceil(s*100)/100,rate};
+}
+function hasVideos(p){return!!(p.vidBig&&p.vidShort)}
+function isReady(p){return hasVideos(p)}
+
+// ── Price calc ────────────────────────────────────────────────────────────────
+function calcTypePrice(){
+  const res=calcSuggestedPrice(document.getElementById('pt-materials')?.value,document.getElementById('pt-labor')?.value,document.getElementById('pt-other')?.value,document.getElementById('pt-margin')?.value,document.getElementById('pt-weight')?.value,document.getElementById('pt-ship-method')?.value||'priority',document.getElementById('pt-ship-include')?.value==='yes');
+  const rd=document.getElementById('pt-price-result');if(!rd)return;
+  if(!res){rd.style.display='none';return;}
+  rd.style.display='';
+  const{totalCost,shipCost,suggested,rate}=res;_typeSuggested=suggested;
+  const etsy=suggested*0.065;const profit=suggested-totalCost-(document.getElementById('pt-ship-include')?.value==='yes'?shipCost:0)-etsy;
+  document.getElementById('pt-r-cost').textContent='$'+totalCost.toFixed(2);
+  document.getElementById('pt-r-ship').textContent=rate?'~$'+rate.toFixed(2):'N/A';
+  document.getElementById('pt-r-etsy').textContent='~$'+etsy.toFixed(2);
+  document.getElementById('pt-r-price').textContent='$'+suggested.toFixed(2);
+  const pe=document.getElementById('pt-r-profit');pe.textContent='~$'+profit.toFixed(2);pe.className='stat-v '+(profit>=0?'g':'r');
+  const ub=document.getElementById('pt-use-btn');if(ub)ub.textContent='Use $'+suggested.toFixed(2);
+}
+function useTypePrice(){const el=document.getElementById('pt-price');if(el&&_typeSuggested){el.value=_typeSuggested.toFixed(2);syncTypePriceWarning();}}
+function syncTypePriceWarning(){const v=parseFloat(document.getElementById('pt-price')?.value)||0;const w=document.getElementById('pt-price-warn');if(w)w.textContent=(_typeSuggested&&v<_typeSuggested)?'⚠ Below suggested $'+_typeSuggested.toFixed(2):'';}
+function calcShipping(prefix){
+  const price=parseFloat(document.getElementById(prefix+'-price')?.value)||0;const weight=parseFloat(document.getElementById(prefix+'-weight')?.value)||0;const method=document.getElementById(prefix+'-ship-method')?.value||'priority';
+  const rd=document.getElementById(prefix+'-price-result');if(!rd)return;
+  if(!price&&!weight){rd.style.display='none';return;}rd.style.display='';
+  const{rate,note}=estShipping(weight,method);const ship=rate||0;const ef=price*0.065;const profit=price-ship-ef;
+  document.getElementById(prefix+'-r-price').textContent='$'+price.toFixed(2);document.getElementById(prefix+'-r-ship').textContent=rate?'~$'+rate.toFixed(2):'N/A';document.getElementById(prefix+'-r-etsy').textContent='~$'+ef.toFixed(2);
+  const pe2=document.getElementById(prefix+'-r-profit');pe2.textContent='~$'+profit.toFixed(2);pe2.className='stat-v '+(profit>=0?'g':'r');document.getElementById(prefix+'-r-note').textContent=note;
+}
+
+// ── Panel toggle ──────────────────────────────────────────────────────────────
+function togglePanel(which){
+  const panels={color:'panel-color',type:'panel-type',add:'panel-add'};
+  const btns={color:'toggle-color-btn',type:'toggle-type-btn',add:'toggle-add-btn'};
+  const labels={color:'◉ Colors',type:'+ New product type',add:'+ Add products'};
+  Object.keys(panels).forEach(k=>{
+    const isThis=k===which;const panel=document.getElementById(panels[k]);const btn=document.getElementById(btns[k]);if(!panel||!btn)return;
+    const isOpen=panel.style.display!=='none';
+    if(isThis){const nowOpen=!isOpen;panel.style.display=nowOpen?'':'none';btn.textContent=nowOpen?'✕ Cancel':labels[k];btn.className=nowOpen?'btn':(k==='add'?'btn btn-p':'btn');
+      if(nowOpen){if(k==='color')renderColorPanel();if(k==='type')renderTypePanel();if(k==='add')setupAddPanel();panel.scrollIntoView({behavior:'smooth',block:'nearest'});}
+    } else {panel.style.display='none';btn.textContent=labels[k];btn.className=k==='add'?'btn btn-p':'btn';}
+  });
+}
+
+function renderColorPanel(){
+  document.getElementById('panel-color').innerHTML=`<div class="card" style="border:1.5px solid var(--purple);max-width:640px;"><div class="card-hdr" style="background:var(--purple-light);"><span class="card-title" style="color:var(--purple-text)">Product colors</span><button class="btn btn-sm" onclick="togglePanel('color')">Cancel</button></div><div style="padding:14px;display:flex;flex-direction:column;gap:12px;"><div class="frow" style="align-items:end;"><div class="fg"><label>Color name</label><input id="pc-name" placeholder="e.g. Lavender, Ocean Blue"></div><div class="fg"><label>Color swatch</label><div style="display:flex;gap:8px;align-items:center;"><input type="color" id="pc-hex" value="#9b72cf" style="width:48px;height:36px;padding:2px 3px;border-radius:var(--r);cursor:pointer;flex-shrink:0;" oninput="document.getElementById('pc-hex-text').value=this.value"><input id="pc-hex-text" placeholder="#9b72cf" maxlength="7" style="font-family:var(--mono);font-size:12px;" oninput="syncColorHex()"></div></div><div class="fg"><label style="opacity:0">.</label><button class="btn btn-p" onclick="addColor()">Add color</button></div></div><div id="pc-list-inline" style="display:flex;flex-direction:column;gap:7px;max-height:200px;overflow-y:auto;"></div></div></div>`;
+  renderProductColors();
+}
+
+function renderTypePanel(){
+  typeColorIds=[];_typeSuggested=0;
+  const colorPicker=productColors.length?productColors.map(c=>`<span onclick="toggleTypeColor('${c.id}',this)" style="display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:20px;font-size:11px;border:2px solid var(--border);background:transparent;cursor:pointer;font-family:var(--mono)"><span style="width:10px;height:10px;border-radius:50%;background:${c.hex};display:inline-block;"></span>${c.name}</span>`).join(''):'<span style="font-size:12px;color:var(--hint)">No colors defined yet</span>';
+  document.getElementById('panel-type').innerHTML=`<div class="card" style="border:1.5px solid var(--blue);max-width:620px;"><div class="card-hdr" style="background:var(--blue-light);"><span class="card-title" style="color:var(--blue-text)">New product type</span><button class="btn btn-sm" onclick="togglePanel('type')">Cancel</button></div><div style="padding:16px;display:flex;flex-direction:column;gap:12px;"><div class="frow"><div class="fg"><label>Type name</label><input id="pt-name" placeholder="e.g. Lavender Soy Candle 8oz"></div><div class="fg"><label>Description</label><input id="pt-desc" placeholder="What makes this unique"></div></div><div class="frow"><div class="fg"><label>Materials ($)</label><input type="number" id="pt-materials" placeholder="0.00" step="0.01" oninput="calcTypePrice()"></div><div class="fg"><label>Labor ($)</label><input type="number" id="pt-labor" placeholder="0.00" step="0.01" oninput="calcTypePrice()"></div><div class="fg"><label>Other costs ($)</label><input type="number" id="pt-other" placeholder="0.00" step="0.01" oninput="calcTypePrice()"></div><div class="fg"><label>Margin (%)</label><input type="number" id="pt-margin" value="30" min="0" oninput="calcTypePrice()"></div></div><div class="frow"><div class="fg"><label>Weight (oz)</label><input type="number" id="pt-weight" placeholder="8" step="0.1" oninput="calcTypePrice()"></div><div class="fg"><label>Shipping method</label><select id="pt-ship-method" onchange="calcTypePrice()"><option value="first_class">USPS First Class</option><option value="priority" selected>USPS Priority</option><option value="ground_adv">USPS Ground Advantage</option><option value="flat_rate_sm">Priority Flat Rate (small)</option><option value="flat_rate_med">Priority Flat Rate (medium)</option></select></div><div class="fg"><label>Shipping included?</label><select id="pt-ship-include" onchange="calcTypePrice()"><option value="yes">Yes — I cover shipping</option><option value="no">No — customer pays</option></select></div></div><div id="pt-price-result" style="display:none;"><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;margin-bottom:6px;"><div class="stat"><div class="stat-l">Total cost</div><div class="stat-v" id="pt-r-cost">—</div></div><div class="stat"><div class="stat-l">Est. shipping</div><div class="stat-v a" id="pt-r-ship">—</div></div><div class="stat"><div class="stat-l">Etsy fee</div><div class="stat-v" id="pt-r-etsy">—</div></div><div class="stat"><div class="stat-l">Suggested price</div><div class="stat-v g" id="pt-r-price">—</div></div><div class="stat"><div class="stat-l">Your profit</div><div class="stat-v g" id="pt-r-profit">—</div></div></div><div style="display:flex;align-items:center;gap:8px;margin-top:6px;"><button class="btn btn-sm" id="pt-use-btn" onclick="useTypePrice()">Use suggested</button><span style="font-size:12px;color:var(--muted)">or manual:</span><input type="number" id="pt-price" placeholder="0.00" step="0.01" style="width:90px;" oninput="syncTypePriceWarning()"><span id="pt-price-warn" style="font-size:12px;color:var(--red);"></span></div></div><div style="border-top:1px solid var(--border);padding-top:12px;"><div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;font-family:var(--mono);margin-bottom:4px;">Videos required</div><div class="frow"><div class="fg"><label>Full video URL</label><input id="pt-vid-big" placeholder="YouTube URL"></div><div class="fg"><label>Shorts URL</label><input id="pt-vid-short" placeholder="YouTube Shorts URL"></div></div></div><div class="fg"><label>Colors</label><div id="pt-color-picker" style="display:flex;flex-wrap:wrap;gap:7px;margin-top:4px;padding:9px 11px;border:1px solid var(--border-strong);border-radius:var(--r);background:var(--bg);min-height:40px;">${colorPicker}</div></div><div style="display:flex;gap:8px;"><button class="btn btn-p" onclick="createProductType()">Save product type</button><button class="btn" onclick="togglePanel('type')">Cancel</button></div></div></div>`;
+}
+
+function toggleTypeColor(cid,el){
+  const c=productColors.find(x=>x.id===cid);
+  if(typeColorIds.includes(cid)){typeColorIds=typeColorIds.filter(x=>x!==cid);el.style.borderColor='var(--border)';el.style.background='transparent';}
+  else{typeColorIds.push(cid);el.style.borderColor=c.hex;el.style.background=c.hex+'22';}
+}
+
+async function createProductType(){
+  const name=document.getElementById('pt-name').value.trim();if(!name){notify('Enter a type name');return;}
+  const t={id:uid(),name,desc:document.getElementById('pt-desc').value.trim(),vidBig:document.getElementById('pt-vid-big').value.trim(),vidShort:document.getElementById('pt-vid-short').value.trim(),price:parseFloat(document.getElementById('pt-price').value)||_typeSuggested||0,materials:parseFloat(document.getElementById('pt-materials').value)||0,labor:parseFloat(document.getElementById('pt-labor').value)||0,weight:parseFloat(document.getElementById('pt-weight').value)||0,shipMethod:document.getElementById('pt-ship-method').value,colorIds:[...typeColorIds],createdAt:Date.now()};
+  productTypes.unshift(t);window._productTypes=productTypes;await saveItem("productTypes",t.id,t);
+  togglePanel('type');renderProducts();notify('Type "'+t.name+'" saved'+(t.vidBig&&t.vidShort?'':" — add videos to unlock inventory"));
+}
+
+// ── Add products panel ────────────────────────────────────────────────────────
+function setupAddPanel(){
+  const opts='<option value="">— choose a type —</option>'+productTypes.map(t=>`<option value="${t.id}">${t.name}${(!t.vidBig||!t.vidShort)?' ⚠':''}</option>`).join('');
+  document.getElementById('panel-add').innerHTML=`<div class="card" style="border:1.5px solid var(--accent);"><div class="card-hdr" style="background:var(--accent-light);"><span class="card-title" style="color:var(--accent-text)">Add products to inventory</span><button class="btn btn-sm" onclick="togglePanel('add')">Cancel</button></div><div style="padding:16px;display:flex;flex-direction:column;gap:16px;"><div><div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;font-family:var(--mono);margin-bottom:10px;">Step 1 — Type, quantity & colors</div><div class="frow" style="margin-bottom:10px;"><div class="fg"><label>Product type</label><select id="ap-type" onchange="onTypeSelect()" style="max-width:340px;">${opts}</select></div><div class="fg"><label>Quantity</label><input type="number" id="ap-qty" min="1" value="1" style="max-width:100px;" oninput="onQtyChange()"></div><div class="fg"><label>Date made</label><input type="date" id="ap-date" value="${new Date().toISOString().split('T')[0]}"></div></div><div id="ap-type-info" style="display:none;padding:9px 12px;background:var(--bg);border-radius:var(--r);font-size:13px;border:1px solid var(--border);margin-bottom:8px;"></div><div id="ap-type-locked" style="display:none;padding:9px 12px;background:var(--amber-light);border-radius:var(--r);font-size:13px;color:var(--amber-text);border:1px solid #d4b07a;margin-bottom:8px;">⚠ This type needs videos before products can be added.</div><div id="ap-color-section" style="display:none;"><div class="fg"><label>Colors</label><div id="ap-color-picker" style="display:flex;flex-wrap:wrap;gap:7px;margin-top:4px;padding:9px 11px;border:1px solid var(--border-strong);border-radius:var(--r);background:var(--bg);min-height:40px;"></div></div></div></div><div id="ap-storage-section" style="display:none;border-top:1px solid var(--border);padding-top:14px;"><div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;font-family:var(--mono);margin-bottom:8px;">Step 2 — Storage</div><div style="display:flex;gap:10px;margin-bottom:12px;flex-wrap:wrap;"><label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;"><input type="radio" name="ap-store-mode" value="auto" checked onchange="onStoreModeChange()" style="width:auto;"> Auto-assign</label><label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;"><input type="radio" name="ap-store-mode" value="same" onchange="onStoreModeChange()" style="width:auto;"> Same for all</label><label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;"><input type="radio" name="ap-store-mode" value="each" onchange="onStoreModeChange()" style="width:auto;"> Per product</label></div><div id="ap-store-auto-info" style="font-size:13px;color:var(--muted);padding:8px 12px;background:var(--bg);border-radius:var(--r);border:1px solid var(--border);"></div><div id="ap-store-same" style="display:none;"><div class="fg"><label>Location for all</label><input id="ap-storage-all" placeholder="e.g. Shelf A" style="max-width:300px;" oninput="refreshAddPreview()"></div></div><div id="ap-store-each" style="display:none;"></div></div><div id="ap-preview-section" style="display:none;border-top:1px solid var(--border);padding-top:14px;"><div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;font-family:var(--mono);margin-bottom:10px;">Step 3 — Review & confirm</div><div id="ap-preview-list" style="display:flex;flex-direction:column;gap:5px;margin-bottom:14px;max-height:260px;overflow-y:auto;"></div><button class="btn btn-p" onclick="addProductsBulk()">✓ Add all to inventory</button></div></div></div>`;
+  apColorIds=[];
+}
+
+function onTypeSelect(){
+  const tid=document.getElementById('ap-type').value;const t=productTypes.find(x=>x.id===tid);
+  const info=document.getElementById('ap-type-info');const locked=document.getElementById('ap-type-locked');const colorSec=document.getElementById('ap-color-section');const storeSec=document.getElementById('ap-storage-section');const prevSec=document.getElementById('ap-preview-section');
+  apColorIds=[];if(!t){[info,locked,colorSec,storeSec,prevSec].forEach(e=>e&&(e.style.display='none'));return;}
+  const hv=!!(t.vidBig&&t.vidShort);
+  info.style.display='';info.innerHTML=`<strong>${t.name}</strong>${t.desc?' — '+t.desc:''} &nbsp;·&nbsp; ${t.vidBig?`<a href="${t.vidBig}" target="_blank" style="color:var(--blue-text)">▶ Full</a>`:'<span style="color:var(--red)">✗ Full</span>'} &nbsp;·&nbsp; ${t.vidShort?`<a href="${t.vidShort}" target="_blank" style="color:var(--blue-text)">▶ Short</a>`:'<span style="color:var(--red)">✗ Short</span>'}`;
+  locked.style.display=hv?'none':'';
+  if(!hv){[colorSec,storeSec,prevSec].forEach(e=>e&&(e.style.display='none'));return;}
+  colorSec.style.display='';apColorIds=[...(t.colorIds||[])];
+  const picker=document.getElementById('ap-color-picker');
+  picker.innerHTML=productColors.length?productColors.map(c=>{const s=apColorIds.includes(c.id);return`<span onclick="toggleApColor('${c.id}',this)" style="display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:20px;font-size:11px;border:2px solid ${s?c.hex:'var(--border)'};background:${s?c.hex+'22':'transparent'};cursor:pointer;font-family:var(--mono);"><span style="width:10px;height:10px;border-radius:50%;background:${c.hex};display:inline-block;"></span>${c.name}</span>`}).join(''):'<span style="font-size:12px;color:var(--hint)">No colors</span>';
+  refreshAddPreview();
+}
+function toggleApColor(cid,el){const c=productColors.find(x=>x.id===cid);if(apColorIds.includes(cid)){apColorIds=apColorIds.filter(x=>x!==cid);el.style.borderColor='var(--border)';el.style.background='transparent';}else{apColorIds.push(cid);el.style.borderColor=c.hex;el.style.background=c.hex+'22';}refreshAddPreview();}
+function onQtyChange(){refreshAddPreview();}
+function onStoreModeChange(){const m=document.querySelector('input[name="ap-store-mode"]:checked')?.value||'auto';document.getElementById('ap-store-auto-info').style.display=m==='auto'?'':'none';document.getElementById('ap-store-same').style.display=m==='same'?'':'none';document.getElementById('ap-store-each').style.display=m==='each'?'':'none';if(m==='each')buildEachStorageInputs();refreshAddPreview();}
+function buildEachStorageInputs(){const qty=parseInt(document.getElementById('ap-qty')?.value)||1;const tid=document.getElementById('ap-type')?.value;const nextNum=seq.p+1;const existing=products.filter(p=>p.typeId===tid&&p.storage);let def='';if(existing.length){const f={};existing.forEach(p=>{f[p.storage]=(f[p.storage]||0)+1;});def=Object.entries(f).sort((a,b)=>b[1]-a[1])[0][0];}document.getElementById('ap-store-each').innerHTML='<div style="display:grid;grid-template-columns:90px 1fr;gap:6px;margin-bottom:6px;"><span style="font-size:11px;font-weight:600;color:var(--muted);font-family:var(--mono)">PROD #</span><span style="font-size:11px;font-weight:600;color:var(--muted);font-family:var(--mono)">STORAGE</span></div>'+Array.from({length:qty},(_,i)=>`<div style="display:grid;grid-template-columns:90px 1fr;gap:6px;align-items:center;margin-bottom:5px;"><span class="pnum">P-${nextNum+i}</span>${buildStorageSelect('ap-each-'+i,def,'refreshAddPreview()')}</div>`).join('');}
+function refreshAddPreview(){const tid=document.getElementById('ap-type')?.value;const t=productTypes.find(x=>x.id===tid);if(!t||!t.vidBig||!t.vidShort){document.getElementById('ap-storage-section').style.display='none';document.getElementById('ap-preview-section').style.display='none';return;}const qty=parseInt(document.getElementById('ap-qty')?.value)||1;if(!qty){document.getElementById('ap-preview-section').style.display='none';return;}document.getElementById('ap-storage-section').style.display='';const mode=document.querySelector('input[name="ap-store-mode"]:checked')?.value||'auto';const existing=products.filter(p=>p.typeId===tid&&p.storage);let auto='';if(existing.length){const f={};existing.forEach(p=>{f[p.storage]=(f[p.storage]||0)+1;});auto=Object.entries(f).sort((a,b)=>b[1]-a[1])[0][0];}else if(storageLocations.length)auto=storageLocations[0].name;const ai=document.getElementById('ap-store-auto-info');ai.style.display=mode==='auto'?'':'none';ai.innerHTML=auto?`Will assign: <strong style="font-family:var(--mono)">${auto}</strong>`:'⚠ No storage locations defined';document.getElementById('ap-preview-section').style.display='';const nextNum=seq.p+1;const cl=apColorIds.map(cid=>productColors.find(x=>x.id===cid)?.name||'').filter(Boolean).join(', ');document.getElementById('ap-preview-list').innerHTML=Array.from({length:qty},(_,i)=>{let s='';if(mode==='auto')s=auto||'—';else if(mode==='same')s=document.getElementById('ap-storage-all')?.value||'—';else s=document.getElementById('ap-each-'+i)?.value||auto||'—';return`<div style="display:grid;grid-template-columns:90px 1fr 160px;gap:8px;align-items:center;padding:6px 10px;background:var(--bg);border-radius:var(--r);border:1px solid var(--border);"><span class="pnum" style="font-size:12px">P-${nextNum+i}</span><span style="font-size:13px">${t.name}${cl?' — '+cl:''}</span><span style="font-size:12px;color:var(--muted)">▦ ${s}</span></div>`;}).join('');}
+
+async function addProductsBulk(){
+  const tid=document.getElementById('ap-type').value;const t=productTypes.find(x=>x.id===tid);if(!t){notify('Select a type');return;}if(!t.vidBig||!t.vidShort){notify('Type needs videos first');return;}
+  const qty=parseInt(document.getElementById('ap-qty').value)||1;const dateMade=document.getElementById('ap-date').value;const mode=document.querySelector('input[name="ap-store-mode"]:checked')?.value||'auto';
+  const cl=apColorIds.map(cid=>productColors.find(x=>x.id===cid)?.name||'').filter(Boolean).join(', ');
+  const existing=products.filter(p=>p.typeId===tid&&p.storage);let auto='';if(existing.length){const f={};existing.forEach(p=>{f[p.storage]=(f[p.storage]||0)+1;});auto=Object.entries(f).sort((a,b)=>b[1]-a[1])[0][0];}else if(storageLocations.length)auto=storageLocations[0].name;
+  const firstNum=seq.p+1;
+  for(let i=0;i<qty;i++){let s='';if(mode==='auto')s=auto;else if(mode==='same')s=document.getElementById('ap-storage-all')?.value||auto;else s=document.getElementById('ap-each-'+i)?.value||auto;
+    const pn=await nProd();const p={id:uid(),productNum:pn,name:t.name+(cl?' — '+cl:''),typeId:t.id,typeName:t.name,colorIds:[...apColorIds],desc:t.desc||'',storage:s,dateMade,price:t.price||0,weight:t.weight||0,shipMethod:t.shipMethod||'priority',vidBig:t.vidBig,vidShort:t.vidShort,qty:1,onEtsy:false,createdAt:Date.now()};
+    products.unshift(p);window._products=products;await saveItem("products",p.id,p);}
+  togglePanel('add');renderProducts();notify(qty+' product'+(qty>1?'s':'')+' added — P-'+firstNum+' through P-'+seq.p);
+}
+
+// ── Products table ────────────────────────────────────────────────────────────
+function setPF(f,el){pf=f;document.querySelectorAll('#page-products .chip').forEach(c=>c.classList.remove('active'));el.classList.add('active');renderProducts();}
+function renderProducts(){
+  const cc=document.getElementById('color-filter-chips');if(cc)cc.innerHTML=productColors.map(c=>`<span class="chip ${pf==='color:'+c.id?'active':''}" onclick="setPF('color:${c.id}',this)" style="display:inline-flex;align-items:center;gap:4px;"><span style="width:9px;height:9px;border-radius:50%;background:${c.hex};display:inline-block;border:1px solid rgba(0,0,0,.15)"></span>${c.name}</span>`).join('');
+  const tc=document.getElementById('type-filter-chips2');if(tc)tc.innerHTML=productTypes.map(t=>`<span class="chip ${pf==='type:'+t.id?'active':''}" onclick="setPF('type:${t.id}',this)">${t.name}</span>`).join('');
+  const search=(document.getElementById('prod-search')?.value||'').toLowerCase();let list=products;
+  if(pf==='ready')list=list.filter(p=>p.vidBig&&p.vidShort);if(pf==='no-video')list=list.filter(p=>!p.vidBig||!p.vidShort);if(pf==='etsy')list=list.filter(p=>p.onEtsy);if(pf.startsWith('color:'))list=list.filter(p=>(p.colorIds||[]).includes(pf.slice(6)));if(pf.startsWith('type:'))list=list.filter(p=>p.typeId===pf.slice(5));if(search)list=list.filter(p=>(p.name+p.productNum+(p.typeName||'')).toLowerCase().includes(search));
+  const tb=document.getElementById('prod-table');if(!tb)return;
+  if(!list.length){tb.innerHTML='<tr class="erow"><td colspan="11">No products found</td></tr>';}
+  else{tb.innerHTML=list.map(p=>{const vb=p.vidBig?`<a href="${p.vidBig}" target="_blank" style="color:var(--blue-text);font-size:11px;">▶ Full</a>`:'<span style="color:var(--red);font-size:11px;">✗</span>';const vs=p.vidShort?`<a href="${p.vidShort}" target="_blank" style="color:var(--blue-text);font-size:11px;">▶ Short</a>`:'<span style="color:var(--red);font-size:11px;">✗</span>';const sw=(p.colorIds||[]).map(cid=>{const c=productColors.find(x=>x.id===cid);return c?`<span title="${c.name}" style="width:14px;height:14px;border-radius:50%;background:${c.hex};display:inline-block;border:1px solid rgba(0,0,0,.15);"></span>`:''}).join(' ');const sh=p.shipMethod&&p.weight?estShipping(p.weight,p.shipMethod):{rate:null};return`<tr><td><span class="pnum">${p.productNum}</span></td><td>${sw||'—'}</td><td style="font-size:12px;color:var(--muted)">${p.typeName||'—'}</td><td style="font-weight:500;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${p.name}">${p.name}</td><td>${vb} ${vs}</td><td><span class="badge ${p.qty===0?'br':p.qty<=2?'ba':'bg'}">${p.qty}</span></td><td>${p.price?'$'+parseFloat(p.price).toFixed(2):'—'}</td><td style="font-size:12px;color:var(--muted)">${sh.rate?'~$'+sh.rate.toFixed(2):'—'}</td><td style="font-size:12px;color:var(--muted)">${p.storage||'—'}</td><td>${p.onEtsy?'<span class="badge bg">✓</span>':'<span class="badge bgr">No</span>'}</td><td><button class="btn btn-sm" onclick="openProdDetail('${p.id}')">Edit</button></td></tr>`;}).join('');}
+  const tl=document.getElementById('pt-type-list');const nt=document.getElementById('pt-no-types');
+  if(tl){if(!productTypes.length){if(nt)nt.style.display='';tl.innerHTML='';return;}if(nt)nt.style.display='none';tl.innerHTML=productTypes.map(t=>{const hv=!!(t.vidBig&&t.vidShort);const cnt=products.filter(p=>p.typeId===t.id).length;const sw=(t.colorIds||[]).map(cid=>{const c=productColors.find(x=>x.id===cid);return c?`<span title="${c.name}" style="width:12px;height:12px;border-radius:50%;background:${c.hex};display:inline-block;border:1px solid rgba(0,0,0,.15);"></span>`:''}).join(' ');return`<div style="display:flex;align-items:center;gap:10px;padding:9px 13px;background:var(--surface);border:1px solid var(--border);border-radius:var(--r);flex-wrap:wrap;"><span style="font-size:13px;font-weight:500;flex:1;min-width:140px">${t.name}</span><span>${sw}</span><span style="font-size:12px;color:var(--muted)">${cnt} unit${cnt!==1?'s':''}</span><span style="font-size:12px;color:var(--muted)">${t.price?'$'+parseFloat(t.price).toFixed(2):''}</span>${hv?'<span class="badge bg" style="font-size:11px;">✓ Videos</span>':'<span class="badge br" style="font-size:11px;">⚠ No videos</span>'}<button class="btn btn-sm" onclick="openTypeEditModal('${t.id}')">Edit</button><button class="btn btn-sm btn-d" onclick="deleteType('${t.id}')">Delete</button></div>`;}).join('');}
+}
+
+function openTypeEditModal(tid){const t=productTypes.find(x=>x.id===tid);if(!t)return;editPId='TYPE:'+tid;document.getElementById('pm-title').textContent='Edit type: '+t.name;document.getElementById('pm-body').innerHTML=`<div style="display:flex;flex-direction:column;gap:11px;"><div class="frow"><div class="fg"><label>Type name</label><input id="pe-name" value="${t.name}"></div><div class="fg"><label>Description</label><input id="pe-desc" value="${t.desc||''}"></div></div><div style="background:${t.vidBig&&t.vidShort?'var(--accent-light)':'var(--amber-light)'};border-radius:var(--r);padding:9px 12px;font-size:12px;color:${t.vidBig&&t.vidShort?'var(--accent-text)':'var(--amber-text)'};">${t.vidBig&&t.vidShort?'✓ Both videos present':'⚠ Missing videos'}</div><div class="frow"><div class="fg"><label>Full video URL</label><input id="pe-vid-big" value="${t.vidBig||''}" placeholder="YouTube URL"></div><div class="fg"><label>Shorts URL</label><input id="pe-vid-short" value="${t.vidShort||''}" placeholder="Shorts URL"></div></div><div class="frow"><div class="fg"><label>Price ($)</label><input type="number" id="pe-price" value="${t.price||''}" step="0.01"></div><div class="fg"><label>Weight (oz)</label><input type="number" id="pe-weight" value="${t.weight||''}" step="0.1"></div></div></div>`;
+  document.getElementById('pm-save').onclick=saveTypeEdit;document.getElementById('pm-del').onclick=()=>deleteType(tid);OM('prod-modal');}
+async function saveTypeEdit(){if(!editPId||!editPId.startsWith('TYPE:'))return;const tid=editPId.slice(5);const t=productTypes.find(x=>x.id===tid);if(!t)return;t.name=document.getElementById('pe-name').value.trim()||t.name;t.desc=document.getElementById('pe-desc').value.trim();t.vidBig=document.getElementById('pe-vid-big').value.trim();t.vidShort=document.getElementById('pe-vid-short').value.trim();t.price=parseFloat(document.getElementById('pe-price').value)||t.price||0;t.weight=parseFloat(document.getElementById('pe-weight').value)||t.weight||0;products.filter(p=>p.typeId===tid).forEach(p=>{p.vidBig=t.vidBig;p.vidShort=t.vidShort;p.price=t.price||p.price;p.typeName=t.name;});await saveItem("productTypes",t.id,t);for(const p of products.filter(x=>x.typeId===tid))await saveItem("products",p.id,p);CM('prod-modal');renderProducts();notify('Type updated');}
+async function deleteType(tid){if(products.some(p=>p.typeId===tid)){notify('Cannot delete — products exist for this type');return;}productTypes=productTypes.filter(x=>x.id!==tid);window._productTypes=productTypes;await delItem("productTypes",tid);CM('prod-modal');renderProducts();notify('Type deleted');}
+
+// ── Product detail ────────────────────────────────────────────────────────────
+function openProdDetail(id){
+  const p=products.find(x=>x.id===id);if(!p)return;editPId=id;document.getElementById('pm-title').textContent=p.productNum+' — '+p.name;const rv=isReady(p);
+  const cph=productColors.map(c=>{const s=(p.colorIds||[]).includes(c.id);return`<span onclick="toggleEditColor('${c.id}',this)" data-cid="${c.id}" title="${c.name}" style="display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:20px;font-size:11px;border:2px solid ${s?c.hex:'var(--border)'};background:${s?c.hex+'22':'transparent'};cursor:pointer;transition:all .15s;font-family:var(--mono)"><span style="width:10px;height:10px;border-radius:50%;background:${c.hex};display:inline-block;"></span>${c.name}</span>`;}).join('');
+  document.getElementById('pm-body').innerHTML=`<div style="display:flex;flex-direction:column;gap:13px;"><div class="frow"><div class="fg"><label>Name</label><input id="pe-name" value="${p.name}"></div><div class="fg"><label>Storage</label>${buildStorageSelect('pe-storage',p.storage||'')}</div></div><div class="fg"><label>Description</label><textarea id="pe-desc">${p.desc||''}</textarea></div><div class="fg"><label>Colors</label><div id="pe-color-picker" style="display:flex;flex-wrap:wrap;gap:7px;margin-top:4px;padding:10px;border:1px solid var(--border-strong);border-radius:var(--r);background:var(--bg);min-height:42px;">${productColors.length?cph:'<span style="font-size:12px;color:var(--hint)">No colors defined</span>'}</div></div><div style="border-top:1px solid var(--border);padding-top:12px;"><div style="font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;font-family:var(--mono);margin-bottom:10px">Pricing</div><div class="frow"><div class="fg"><label>Price ($)</label><input type="number" id="pe-price" value="${p.price||''}" step="0.01" oninput="calcShipping('pe')"></div><div class="fg"><label>Weight (oz)</label><input type="number" id="pe-weight" value="${p.weight||''}" step="0.1" oninput="calcShipping('pe')"></div><div class="fg"><label>Ship method</label><select id="pe-ship-method" onchange="calcShipping('pe')"><option value="first_class" ${p.shipMethod==='first_class'?'selected':''}>USPS First Class</option><option value="priority" ${p.shipMethod==='priority'||!p.shipMethod?'selected':''}>USPS Priority</option><option value="ground_adv" ${p.shipMethod==='ground_adv'?'selected':''}>USPS Ground Advantage</option><option value="flat_rate_sm" ${p.shipMethod==='flat_rate_sm'?'selected':''}>Flat Rate (small)</option><option value="flat_rate_med" ${p.shipMethod==='flat_rate_med'?'selected':''}>Flat Rate (medium)</option></select></div></div><div id="pe-price-result" style="margin-top:12px;display:${p.price?'':'none'}"><div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;"><div class="stat"><div class="stat-l">Price</div><div class="stat-v g" id="pe-r-price">${p.price?'$'+parseFloat(p.price).toFixed(2):'—'}</div></div><div class="stat"><div class="stat-l">Est. ship</div><div class="stat-v a" id="pe-r-ship">—</div></div><div class="stat"><div class="stat-l">Etsy fee</div><div class="stat-v" id="pe-r-etsy">—</div></div><div class="stat"><div class="stat-l">Est. profit</div><div class="stat-v" id="pe-r-profit">—</div></div></div><div id="pe-r-note" style="font-size:11px;color:var(--muted);margin-top:6px;"></div></div></div><div style="background:${rv?'var(--accent-light)':'var(--amber-light)'};border-radius:var(--r);padding:9px 12px;font-size:12px;color:${rv?'var(--accent-text)':'var(--amber-text)'};">${rv?'✓ Videos uploaded — units can be added':'⚠ Add both videos to unlock inventory'}</div><div class="frow"><div class="fg"><label>Full video URL</label><input id="pe-vid-big" value="${p.vidBig||''}" placeholder="YouTube URL"></div><div class="fg"><label>Shorts URL</label><input id="pe-vid-short" value="${p.vidShort||''}" placeholder="Shorts URL"></div></div>${rv?`<div class="frow"><div class="fg"><label>Units in stock</label><input type="number" id="pe-qty" value="${p.qty}" min="0"></div><div class="fg"><label>Date made</label><input type="date" id="pe-date" value="${p.dateMade||''}"></div></div>`:'<div style="font-size:12px;color:var(--muted)">Units locked until both videos are added.</div>'}<div style="display:flex;align-items:center;gap:7px;"><input type="checkbox" id="pe-etsy" style="width:auto" ${p.onEtsy?'checked':''}><label for="pe-etsy" style="font-size:13px;font-family:var(--sans);font-weight:400">Added to Etsy listing</label></div></div>`;
+  document.getElementById('pm-save').onclick=saveProdEdit;document.getElementById('pm-del').onclick=()=>deleteProd(id);if(p.price)setTimeout(()=>calcShipping('pe'),50);OM('prod-modal');}
+function toggleEditColor(cid,el){const p=products.find(x=>x.id===editPId);if(!p)return;if(!p.colorIds)p.colorIds=[];const c=productColors.find(x=>x.id===cid);if(p.colorIds.includes(cid)){p.colorIds=p.colorIds.filter(x=>x!==cid);el.style.borderColor='var(--border)';el.style.background='transparent';}else{p.colorIds.push(cid);el.style.borderColor=c.hex;el.style.background=c.hex+'22';}}
+async function saveProdEdit(){const p=products.find(x=>x.id===editPId);if(!p)return;const wr=isReady(p);p.name=document.getElementById('pe-name').value.trim()||p.name;p.desc=document.getElementById('pe-desc').value.trim();p.storage=document.getElementById('pe-storage').value.trim();p.price=parseFloat(document.getElementById('pe-price').value)||0;p.weight=parseFloat(document.getElementById('pe-weight').value)||0;p.shipMethod=document.getElementById('pe-ship-method').value;p.vidBig=document.getElementById('pe-vid-big').value.trim();p.vidShort=document.getElementById('pe-vid-short').value.trim();p.onEtsy=document.getElementById('pe-etsy').checked;if(isReady(p)&&document.getElementById('pe-qty')){p.qty=parseInt(document.getElementById('pe-qty').value)||0;p.dateMade=document.getElementById('pe-date')?.value||'';}await saveItem("products",p.id,p);window._products=products;if(!wr&&isReady(p))notify('Videos added! You can now set stock.');CM('prod-modal');renderProducts();notify('Product updated');}
+async function deleteProd(id){if(!confirm('Delete this product?'))return;products=products.filter(x=>x.id!==id);window._products=products;await delItem("products",id);CM('prod-modal');renderProducts();notify('Deleted');}
+
+// ── Dashboard ─────────────────────────────────────────────────────────────────
+function renderDash(){
+  const tu=products.reduce((a,p)=>a+p.qty,0);const nv=products.filter(p=>!hasVideos(p));const oo=orders.filter(o=>(o.fillDone||[]).length<fillSteps.length||fillSteps.length===0);
+  const tm=new Date();tm.setDate(1);tm.setHours(0,0,0,0);const mt=txs.filter(t=>new Date(t.date)>=tm);const mi=mt.filter(t=>t.type==='income').reduce((a,t)=>a+t.amt,0);const me=mt.filter(t=>t.type==='expense').reduce((a,t)=>a+t.amt,0);
+  document.getElementById('d-stats').innerHTML=`<div class="stat"><div class="stat-l">Product types</div><div class="stat-v b">${productTypes.length}</div></div><div class="stat"><div class="stat-l">Products</div><div class="stat-v">${products.length}</div></div><div class="stat"><div class="stat-l">Total units</div><div class="stat-v g">${tu}</div></div><div class="stat"><div class="stat-l">Open orders</div><div class="stat-v a">${oo.length}</div></div><div class="stat"><div class="stat-l">Need videos</div><div class="stat-v ${nv.length?'r':'g'}">${nv.length}</div></div><div class="stat"><div class="stat-l">Month income</div><div class="stat-v g">$${mi.toFixed(2)}</div></div><div class="stat"><div class="stat-l">Month expenses</div><div class="stat-v r">$${me.toFixed(2)}</div></div>`;
+  const ro=[...orders].sort((a,b)=>b.createdAt-a.createdAt).slice(0,5);
+  document.getElementById('d-orders').innerHTML=ro.length?ro.map(o=>{const d=o.fillDone?o.fillDone.length:0;const tot=fillSteps.length;const pct=tot?Math.round(d/tot*100):0;return`<tr style="cursor:pointer" onclick="openOrdDetail('${o.id}')"><td><span class="pnum">${o.orderNum}</span></td><td>${o.customer||'—'}</td><td><div class="progress-bar"><div class="progress-fill" style="width:${pct}%;background:${pct===100?'var(--accent)':'var(--amber)'}"></div></div> <span style="font-size:11px;color:var(--muted)">${d}/${tot}</span></td><td><span class="pnum">${o.etsyNum||'—'}</span></td></tr>`;}).join(''):'<tr class="erow"><td colspan="4">No orders yet</td></tr>';
+  document.getElementById('d-videos').innerHTML=nv.length?nv.slice(0,6).map(p=>`<tr><td><span class="pnum">${p.productNum}</span> ${p.name}</td><td>${!p.vidBig?'<span class="badge br">Full</span>':''} ${!p.vidShort?'<span class="badge ba">Short</span>':''}</td></tr>`).join(''):'<tr class="erow"><td colspan="2">All products have videos ✓</td></tr>';
+  document.getElementById('d-finance').innerHTML=`<div class="stat"><div class="stat-l">Month income</div><div class="stat-v g">$${mi.toFixed(2)}</div></div><div class="stat"><div class="stat-l">Month expenses</div><div class="stat-v r">$${me.toFixed(2)}</div></div><div class="stat"><div class="stat-l">Net profit</div><div class="stat-v ${mi-me>=0?'g':'r'}">$${(mi-me).toFixed(2)}</div></div>`;
+  const ptEl=document.getElementById('d-types');if(ptEl){if(!productTypes.length){ptEl.innerHTML='<tr class="erow"><td colspan="4">No product types yet</td></tr>';return;}ptEl.innerHTML=productTypes.map(t=>{const cnt=products.filter(p=>p.typeId===t.id).length;const hv=!!(t.vidBig&&t.vidShort);return`<tr><td style="font-weight:500">${t.name}</td><td><span class="badge ${hv?'bg':'br'}">${hv?'✓ Videos':'⚠ No videos'}</span></td><td><span class="pnum">${cnt}</span> units</td><td>${t.price?'$'+parseFloat(t.price).toFixed(2):'—'}</td></tr>`;}).join('');}
+}
+
+// ── Orders ────────────────────────────────────────────────────────────────────
+function setOF(f,el){of=f;document.querySelectorAll('#page-orders .chip').forEach(c=>c.classList.remove('active'));el.classList.add('active');renderOrders();}
+function renderOrders(){
+  const search=(document.getElementById('ord-search')?.value||'').toLowerCase();let list=[...orders].sort((a,b)=>b.createdAt-a.createdAt);
+  if(of==='open')list=list.filter(o=>(o.fillDone||[]).length<fillSteps.length);if(of==='done')list=list.filter(o=>fillSteps.length>0&&(o.fillDone||[]).length===fillSteps.length);if(search)list=list.filter(o=>((o.orderNum+o.etsyNum+o.customer)||'').toLowerCase().includes(search));
+  const tb=document.getElementById('ord-table');if(!tb)return;
+  tb.innerHTML=list.length?list.map(o=>{const fd=o.fillDone?o.fillDone.length:0;const ft=fillSteps.length;const fp=ft?Math.round(fd/ft*100):0;const cs=fillSteps.find(s=>!(o.fillDone||[]).includes(s.id));return`<tr><td><span class="pnum">${o.orderNum}</span></td><td><span class="pnum">${o.etsyNum||'—'}</span></td><td>${o.customer||'—'}</td><td style="font-size:12px;color:var(--muted);max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${o.items?o.items.map(i=>i.name).join(', '):'—'}</td><td>${o.total?'$'+parseFloat(o.total).toFixed(2):'—'}</td><td><div style="display:flex;align-items:center;gap:6px"><div class="progress-bar"><div class="progress-fill" style="width:${fp}%;background:${fp===100?'var(--accent)':'var(--amber)'}"></div></div><span style="font-size:11px;color:var(--muted);font-family:var(--mono)">${fd}/${ft}</span></div></td><td>${cs&&fd<ft?`<span class="badge ba">${cs.name}</span>`:'<span class="badge bg">✓ Done</span>'}</td><td><button class="btn btn-sm btn-p" onclick="openOrdDetail('${o.id}')">Manage</button></td></tr>`;}).join(''):'<tr class="erow"><td colspan="8">No orders found</td></tr>';
+}
+
+function openOrdDetail(id){const o=orders.find(x=>x.id===id);if(!o)return;document.getElementById('om-title').textContent='Order '+o.orderNum+(o.etsyNum?' · Etsy #'+o.etsyNum:'');document.getElementById('om-body').innerHTML=buildOrdBody(o);OM('ord-modal');}
+function buildOrdBody(o){
+  const dc=(o.fillDone||[]).length;const tot=fillSteps.length;const pct=tot?Math.round(dc/tot*100):0;const ad=tot>0&&dc===tot;
+  let ih='';if(o.items&&o.items.length){const rows=o.items.map(item=>{const need=item.qty||1;const assigned=(o.assignedProducts||{})[item.name]||[];const have=assigned.length;const matches=products.filter(p=>{const nm=p.name.toLowerCase();const itnm=item.name.toLowerCase();return(nm.includes(itnm)||itnm.includes((p.typeName||'').toLowerCase()))&&p.qty>0;});const st=have>=need?'bg':matches.length?'ba':'br';const stxt=have>=need?'&#10003; Ready':matches.length?`In stock (${matches.length})`:'&#10007; Not in stock';const ab=have<need&&matches.length?`<div style="margin-top:8px"><div style="font-size:11px;color:var(--muted);margin-bottom:5px;font-family:var(--mono);text-transform:uppercase;letter-spacing:.05em">Click to assign</div><div style="display:flex;flex-wrap:wrap;gap:6px">${matches.slice(0,10).map(p=>`<button onclick="assignProduct('${o.id}','${encodeURIComponent(item.name)}','${p.id}')" style="display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:var(--r);border:1px solid var(--border);background:var(--bg);cursor:pointer;font-size:12px;"><span style="font-family:var(--mono);font-size:11px;color:var(--muted)">${p.productNum}</span><span style="color:var(--muted)">&#9634; ${p.storage||'No loc'}</span></button>`).join('')}</div></div>`:'';const at=assigned.length?`<div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:5px">${assigned.map(pid=>{const ap=products.find(x=>x.id===pid);return ap?`<span style="display:inline-flex;align-items:center;gap:5px;padding:3px 8px;border-radius:20px;background:var(--accent-light);border:1px solid #b0ccb0;font-size:12px"><span style="font-family:var(--mono);font-size:11px">${ap.productNum}</span><span style="color:var(--accent-text)">&#9634; ${ap.storage||'no loc'}</span><button onclick="unassignProduct('${o.id}','${encodeURIComponent(item.name)}','${pid}')" style="background:none;border:none;cursor:pointer;color:var(--red);font-size:14px;padding:0 2px;line-height:1">x</button></span>`:''}).join('')}</div>`:'';return`<div style="padding:10px 12px;border:1px solid var(--border);border-radius:var(--r);background:var(--surface);margin-bottom:7px"><div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><span style="font-weight:500;font-size:13px;flex:1">${item.name}${need>1?` <span style="color:var(--muted)">x${need}</span>`:''}</span><span class="badge ${st}" style="font-size:11px">${stxt}</span></div>${at}${ab}</div>`;}).join('');ih=`<div style="margin-bottom:16px"><div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-family:var(--mono);margin-bottom:8px">Items — inventory check</div>${rows}</div>`;}
+  const fh=fillSteps.map((fs,i)=>{const done=(o.fillDone||[]).includes(fs.id);const meta=((o.fillMeta||{})[fs.id])||{};const ts=meta.ts?new Date(meta.ts).toLocaleString():'';const loc=meta.loc||'';return`<div class="fill-step"><div class="fill-step-hdr ${done?'done':''}" onclick="toggleSection('fss-${o.id}-${fs.id}')"><div class="fill-step-num">${done?'&#10003;':i+1}</div><span class="fill-step-name">${fs.name}</span><div style="display:flex;align-items:center;gap:8px;margin-left:auto">${done&&ts?`<span style="font-size:11px;color:var(--accent-text);font-family:var(--mono)">${ts}</span>`:''} ${done&&loc?`<span style="font-size:11px;color:var(--accent-text)">&#9634; ${loc}</span>`:''}<span style="font-size:12px;color:${done?'var(--accent-text)':'var(--muted)'}">${done?'Complete':'Pending'}</span><span style="font-size:11px;color:var(--hint)">&#9660;</span></div></div><div class="fill-step-body" id="fss-${o.id}-${fs.id}">${fs.inst?`<p style="font-size:13px;color:var(--muted);margin-bottom:10px">${fs.inst}</p>`:''}<div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;margin-bottom:10px">${!done?`<div class="fg" style="min-width:180px"><label>Location at this step</label>${buildStorageSelect('fsloc-'+o.id+'-'+fs.id,loc)}</div>`:'<span style="font-size:12px;color:var(--muted)">Completed</span>'}</div><button class="btn btn-sm ${done?'btn-d':'btn-p'}" onclick="toggleFillStep('${o.id}','${fs.id}')">${done?'&#8629; Mark incomplete':'&#10003; Mark complete'}</button></div></div>`;}).join('');
+  return`<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px;font-size:13px"><div><span style="color:var(--muted)">Customer:</span> <strong>${o.customer||'—'}</strong></div><div><span style="color:var(--muted)">Date:</span> ${o.orderDate||'—'}</div><div><span style="color:var(--muted)">Ship to:</span> ${o.address||'—'}</div><div><span style="color:var(--muted)">Total:</span> ${o.total?'$'+parseFloat(o.total).toFixed(2):'—'}</div><div><span style="color:var(--muted)">Tracking:</span> <span style="font-family:var(--mono);font-size:12px">${o.tracking||'—'}</span></div><div><span style="color:var(--muted)">Carrier:</span> ${o.carrier||'—'}</div></div>${ih}<div style="margin-bottom:16px"><div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px"><div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-family:var(--mono)">Fill order steps</div><div style="display:flex;align-items:center;gap:8px"><div class="progress-bar" style="width:120px"><div class="progress-fill" style="width:${pct}%;background:${pct===100?'var(--accent)':'var(--amber)'}"></div></div><span style="font-size:12px;color:var(--muted);font-family:var(--mono)">${dc}/${tot} done</span>${ad?'<span class="badge bg">&#10003; Order complete</span>':''}</div></div>${fillSteps.length?fh:'<p style="color:var(--hint);font-size:13px">No steps defined.</p>'}</div><div style="border-top:1px solid var(--border);padding-top:14px"><div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-family:var(--mono);margin-bottom:8px">Tracking</div><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><input id="om-track" placeholder="Tracking number" value="${o.tracking||''}" style="width:200px"><select id="om-carrier" style="width:120px"><option value="">Carrier</option>${['USPS','UPS','FedEx','DHL'].map(c=>`<option ${o.carrier===c?'selected':''}>${c}</option>`).join('')}</select><button class="btn btn-sm btn-p" onclick="saveTracking('${o.id}')">Save</button></div></div>`;
+}
+
+async function assignProduct(oid,ine,pid){const o=orders.find(x=>x.id===oid);if(!o)return;const in2=decodeURIComponent(ine);if(!o.assignedProducts)o.assignedProducts={};if(!o.assignedProducts[in2])o.assignedProducts[in2]=[];if(!o.assignedProducts[in2].includes(pid))o.assignedProducts[in2].push(pid);await saveItem("orders",o.id,o);document.getElementById('om-body').innerHTML=buildOrdBody(o);notify('Product assigned');}
+async function unassignProduct(oid,ine,pid){const o=orders.find(x=>x.id===oid);if(!o)return;const in2=decodeURIComponent(ine);if(o.assignedProducts&&o.assignedProducts[in2])o.assignedProducts[in2]=o.assignedProducts[in2].filter(x=>x!==pid);await saveItem("orders",o.id,o);document.getElementById('om-body').innerHTML=buildOrdBody(o);notify('Product unassigned');}
+function toggleSection(id){const el=document.getElementById(id);if(el)el.classList.toggle('open');}
+async function toggleFillStep(oid,fsId){const o=orders.find(x=>x.id===oid);if(!o)return;if(!o.fillDone)o.fillDone=[];if(!o.fillMeta)o.fillMeta={};const done=o.fillDone.includes(fsId);if(done){o.fillDone=o.fillDone.filter(s=>s!==fsId);delete o.fillMeta[fsId];}else{o.fillDone.push(fsId);const le=document.getElementById('fsloc-'+oid+'-'+fsId);o.fillMeta[fsId]={ts:Date.now(),loc:le?le.value:''};}await saveItem("orders",o.id,o);document.getElementById('om-body').innerHTML=buildOrdBody(o);if(document.getElementById('page-orders').classList.contains('active'))renderOrders();if(document.getElementById('page-dashboard').classList.contains('active'))renderDash();}
+async function saveTracking(oid){const o=orders.find(x=>x.id===oid);if(!o)return;o.tracking=document.getElementById('om-track').value.trim();o.carrier=document.getElementById('om-carrier').value;await saveItem("orders",o.id,o);notify('Tracking saved');}
+
+// ── Import order ──────────────────────────────────────────────────────────────
+function setupImport(){ioItemC=0;document.getElementById('io-items').innerHTML='';addIOItem();const d=document.getElementById('io-date');if(d&&!d.value)d.value=new Date().toISOString().split('T')[0];const ek=document.getElementById('etsy-key');if(ek)ek.value=etsyCfg.key||'';const es=document.getElementById('etsy-shop');if(es)es.value=etsyCfg.shop||'';}
+function addIOItem(){ioItemC++;const c=ioItemC;const d=document.createElement('div');d.id='io-item-'+c;d.style.cssText='display:grid;grid-template-columns:2fr 1fr auto;gap:8px;align-items:end;margin-bottom:7px';d.innerHTML=`<div class="fg"><label>Product name</label><input id="ii-n-${c}" placeholder="Item purchased"></div><div class="fg"><label>Qty</label><input type="number" id="ii-q-${c}" value="1" min="1"></div><div class="fg"><label style="opacity:0">.</label><button class="btn btn-sm btn-d" onclick="document.getElementById('io-item-${c}').remove()">✕</button></div>`;document.getElementById('io-items').appendChild(d);}
+async function importOrder(){
+  const cust=document.getElementById('io-cust').value.trim();if(!cust){notify('Enter customer name');return;}
+  const items=[];document.querySelectorAll('[id^="io-item-"]').forEach(div=>{const c=div.id.split('-').pop();const name=document.getElementById('ii-n-'+c)?.value.trim();const qty=parseInt(document.getElementById('ii-q-'+c)?.value)||1;if(name)items.push({name,qty});});
+  const total=parseFloat(document.getElementById('io-total').value)||0;const on=await nOrd();
+  const o={id:uid(),orderNum:on,etsyNum:document.getElementById('io-enum').value.trim(),customer:cust,email:document.getElementById('io-email').value.trim(),address:document.getElementById('io-addr').value.trim(),total,orderDate:document.getElementById('io-date').value,tracking:document.getElementById('io-track').value.trim(),carrier:document.getElementById('io-carrier').value,notes:document.getElementById('io-notes').value.trim(),items,fillDone:[],createdAt:Date.now()};
+  orders.unshift(o);window._orders=orders;await saveItem("orders",o.id,o);
+  if(total>0){const t={id:uid(),date:o.orderDate||new Date().toISOString().split('T')[0],type:'income',desc:'Etsy sale — '+cust,cat:'Etsy sale',amt:total,orderId:o.orderNum,createdAt:Date.now()};txs.unshift(t);window._txs=txs;await saveItem("transactions",t.id,t);}
+  notify('Order '+o.orderNum+' imported');go('orders');
+}
+async function saveEtsyConfig(){etsyCfg.key=document.getElementById('etsy-key').value.trim();etsyCfg.shop=document.getElementById('etsy-shop').value.trim();window._etsyCfg=etsyCfg;await saveMeta("etsyCfg",etsyCfg);const st=document.getElementById('etsy-status');st.innerHTML=etsyCfg.key&&etsyCfg.shop?'<span style="color:var(--accent-text)">✓ Saved to Firebase</span>':'<span style="color:var(--red)">Please enter both fields</span>';}
+
+// ── Finance ───────────────────────────────────────────────────────────────────
+function setFF(f,el){ff=f;document.querySelectorAll('#page-finance .chip').forEach(c=>c.classList.remove('active'));el.classList.add('active');renderFinance();}
+function renderFinance(){
+  const search=(document.getElementById('fin-search')?.value||'').toLowerCase();let list=[...txs].sort((a,b)=>new Date(b.date)-new Date(a.date));if(ff==='income')list=list.filter(t=>t.type==='income');if(ff==='expense')list=list.filter(t=>t.type==='expense');if(search)list=list.filter(t=>(t.desc+t.cat).toLowerCase().includes(search));
+  const income=txs.filter(t=>t.type==='income').reduce((a,t)=>a+t.amt,0);const expense=txs.filter(t=>t.type==='expense').reduce((a,t)=>a+t.amt,0);
+  document.getElementById('fin-stats').innerHTML=`<div class="stat"><div class="stat-l">Total income</div><div class="stat-v g">$${income.toFixed(2)}</div></div><div class="stat"><div class="stat-l">Total expenses</div><div class="stat-v r">$${expense.toFixed(2)}</div></div><div class="stat"><div class="stat-l">Net profit</div><div class="stat-v ${income-expense>=0?'g':'r'}">$${(income-expense).toFixed(2)}</div></div><div class="stat"><div class="stat-l">Transactions</div><div class="stat-v">${txs.length}</div></div>`;
+  const tb=document.getElementById('fin-table');if(!tb)return;
+  tb.innerHTML=list.length?list.map(t=>`<tr><td style="color:var(--muted);font-size:12px">${t.date}</td><td>${t.desc}</td><td><span class="badge bgr">${t.cat}</span></td><td>${t.type==='income'?'<span class="badge bg">Income</span>':'<span class="badge br">Expense</span>'}</td><td class="${t.type==='income'?'money-in':'money-out'}">${t.type==='income'?'+':'-'}$${t.amt.toFixed(2)}</td><td><button class="btn btn-sm btn-d" onclick="deleteTx('${t.id}')">✕</button></td></tr>`).join(''):'<tr class="erow"><td colspan="6">No transactions</td></tr>';
+}
+function openAddTx(){const d=document.getElementById('tx-date');if(d)d.value=new Date().toISOString().split('T')[0];OM('tx-modal');}
+async function saveTx(){const desc=document.getElementById('tx-desc').value.trim();const amt=parseFloat(document.getElementById('tx-amt').value);if(!desc||!amt){notify('Enter description and amount');return;}const t={id:uid(),date:document.getElementById('tx-date').value,type:document.getElementById('tx-type').value,desc,cat:document.getElementById('tx-cat').value,amt,orderId:document.getElementById('tx-order').value.trim(),createdAt:Date.now()};txs.unshift(t);window._txs=txs;await saveItem("transactions",t.id,t);CM('tx-modal');renderFinance();notify('Transaction added');}
+async function deleteTx(id){txs=txs.filter(t=>t.id!==id);window._txs=txs;await delItem("transactions",id);renderFinance();notify('Deleted');}
+
+// ── Reports ───────────────────────────────────────────────────────────────────
+function setupReports(){const now=new Date();const from=document.getElementById('rep-from');const to=document.getElementById('rep-to');if(from&&!from.value){const d=new Date(now.getFullYear(),now.getMonth(),1);from.value=d.toISOString().split('T')[0];}if(to&&!to.value)to.value=now.toISOString().split('T')[0];}
+function generateReport(){const from=new Date(document.getElementById('rep-from').value);const to=new Date(document.getElementById('rep-to').value);to.setHours(23,59,59);const fo=orders.filter(o=>new Date(o.orderDate||o.createdAt)>=from&&new Date(o.orderDate||o.createdAt)<=to);const ft=txs.filter(t=>new Date(t.date)>=from&&new Date(t.date)<=to);const income=ft.filter(t=>t.type==='income').reduce((a,t)=>a+t.amt,0);const expense=ft.filter(t=>t.type==='expense').reduce((a,t)=>a+t.amt,0);const data={period:{from:from.toLocaleDateString(),to:to.toLocaleDateString()},orders:fo,transactions:ft,products,summary:{income,expense,net:income-expense},generated:new Date().toISOString()};const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='shop-report.json';a.click();document.getElementById('rep-status').innerHTML='<span style="color:var(--accent-text)">✓ Report exported. Paste this data into Claude and ask to generate a Word .docx report.</span>';}
+
+// ── Colors ────────────────────────────────────────────────────────────────────
+function syncColorHex(){const txt=document.getElementById('pc-hex-text');const pick=document.getElementById('pc-hex');if(txt&&pick&&txt.value.startsWith('#')&&txt.value.length===7)pick.value=txt.value;}
+async function addColor(){const name=document.getElementById('pc-name').value.trim();if(!name){notify('Enter a color name');return;}const hex=document.getElementById('pc-hex').value;const c={id:uid(),name,hex};productColors.push(c);window._productColors=productColors;await saveItem("productColors",c.id,c);document.getElementById('pc-name').value='';renderProductColors();notify('Color added');}
+function renderProductColors(){const el=document.getElementById('pc-list-inline');if(!el)return;if(!productColors.length){el.innerHTML='<div style="color:var(--hint);font-size:13px;padding:4px">No colors yet</div>';return;}el.innerHTML=productColors.map(c=>`<div style="display:flex;align-items:center;gap:10px;padding:7px 11px;background:var(--bg);border:1px solid var(--border);border-radius:var(--r);"><span style="width:20px;height:20px;border-radius:50%;background:${c.hex};display:inline-block;border:1px solid rgba(0,0,0,.15);flex-shrink:0;"></span><span style="font-size:13px;font-weight:500;flex:1">${c.name}</span><span style="font-family:var(--mono);font-size:11px;color:var(--muted)">${c.hex}</span><span style="font-size:12px;color:var(--muted)">${products.filter(p=>(p.colorIds||[]).includes(c.id)).length} products</span><button class="btn btn-sm btn-d" onclick="delColor('${c.id}')">Delete</button></div>`).join('');}
+async function delColor(id){productColors=productColors.filter(c=>c.id!==id);products.forEach(p=>{if(p.colorIds)p.colorIds=p.colorIds.filter(x=>x!==id)});window._productColors=productColors;await delItem("productColors",id);for(const p of products)await saveItem("products",p.id,p);renderProductColors();}
+
+// ── Storage ───────────────────────────────────────────────────────────────────
+async function addStorageLoc(){const name=document.getElementById('sl-name').value.trim();if(!name){notify('Enter a location name');return;}if(storageLocations.find(s=>s.name===name)){notify('Location already exists');return;}const s={id:uid(),name,desc:document.getElementById('sl-desc').value.trim()};storageLocations.push(s);window._storageLocations=storageLocations;await saveItem("storageLocations",s.id,s);document.getElementById('sl-name').value='';document.getElementById('sl-desc').value='';renderStorage();notify('Location added');}
+function renderStorage(){const el=document.getElementById('sl-list');if(!el)return;if(!storageLocations.length){el.innerHTML='<div style="color:var(--hint);font-size:13px;padding:4px">No locations yet</div>';return;}el.innerHTML=storageLocations.map(s=>`<div style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--bg);border:1px solid var(--border);border-radius:var(--r);"><span style="font-size:16px;color:var(--muted)">▦</span><div style="flex:1"><div style="font-size:13px;font-weight:500">${s.name}</div>${s.desc?`<div style="font-size:11px;color:var(--muted)">${s.desc}</div>`:''}</div><span style="font-size:12px;color:var(--muted)">${products.filter(p=>p.storage===s.name).length} products</span><button class="btn btn-sm" onclick="editStorageLoc('${s.id}')">Edit</button><button class="btn btn-sm btn-d" onclick="delStorageLoc('${s.id}')">Delete</button></div>`).join('');}
+async function editStorageLoc(id){const s=storageLocations.find(x=>x.id===id);if(!s)return;const nn=prompt('Edit location name:',s.name);if(nn===null)return;const tr=nn.trim();if(!tr){notify('Name cannot be empty');return;}const old=s.name;products.forEach(p=>{if(p.storage===old)p.storage=tr;});s.name=tr;window._storageLocations=storageLocations;await saveItem("storageLocations",s.id,s);for(const p of products.filter(x=>x.storage===tr))await saveItem("products",p.id,p);renderStorage();renderProducts();notify('Location updated');}
+async function delStorageLoc(id){const s=storageLocations.find(x=>x.id===id);if(!s)return;const cnt=products.filter(p=>p.storage===s.name).length;if(cnt>0&&!confirm(cnt+' product(s) use "'+s.name+'". Delete anyway?'))return;products.forEach(p=>{if(p.storage===s.name)p.storage='';});storageLocations=storageLocations.filter(x=>x.id!==id);window._storageLocations=storageLocations;await delItem("storageLocations",id);renderStorage();renderProducts();notify('Location deleted');}
+function buildStorageSelect(inputId,currentVal,onchangeFn){if(!storageLocations.length)return`<input id="${inputId}" placeholder="Add locations first" disabled style="background:#fafaf8;color:var(--hint);">`;const opts=storageLocations.map(s=>`<option value="${s.name}"${s.name===currentVal?' selected':''}>${s.name}</option>`).join('');return`<select id="${inputId}" onchange="${onchangeFn||''}" style="font-size:13px;"><option value="">— choose —</option>${opts}</select>`;}
+
+// ── Fill steps ────────────────────────────────────────────────────────────────
+async function addFillStep(){const name=document.getElementById('fs-name').value.trim();if(!name){notify('Enter step name');return;}const s={id:uid(),name,inst:document.getElementById('fs-inst').value.trim()};fillSteps.push(s);window._fillSteps=fillSteps;await saveItem("fillSteps",s.id,s);document.getElementById('fs-name').value='';document.getElementById('fs-inst').value='';renderFillSteps();notify('Step added');}
+function renderFillSteps(){const el=document.getElementById('fs-list');if(!el)return;el.innerHTML=fillSteps.length?fillSteps.map((s,i)=>`<div style="display:flex;align-items:center;gap:9px;padding:9px 12px;background:var(--bg);border:1px solid var(--border);border-radius:var(--r)" draggable="true" ondragstart="dStart(event,'${s.id}')" ondragover="dOver(event)" ondrop="dDrop(event,'${s.id}')"><span style="cursor:grab;color:var(--hint);font-size:16px">⠿</span><span style="font-size:11px;color:var(--hint);font-family:var(--mono);min-width:18px">${i+1}.</span><div style="flex:1"><div style="font-size:13px;font-weight:500">${s.name}</div>${s.inst?`<div style="font-size:11px;color:var(--muted);margin-top:1px">${s.inst}</div>`:''}</div><button class="btn btn-sm btn-d" onclick="delFillStep('${s.id}')">Delete</button></div>`).join(''):'<div style="color:var(--hint);font-size:13px;padding:4px">No steps yet</div>';}
+async function delFillStep(id){fillSteps=fillSteps.filter(s=>s.id!==id);orders.forEach(o=>{if(o.fillDone)o.fillDone=o.fillDone.filter(s=>s!==id)});window._fillSteps=fillSteps;await delItem("fillSteps",id);renderFillSteps();notify('Step deleted');}
+function dStart(e,id){dragId=id;e.dataTransfer.effectAllowed='move';}
+function dOver(e){e.preventDefault();e.dataTransfer.dropEffect='move';}
+async function dDrop(e,tid){e.preventDefault();if(!dragId||dragId===tid)return;const from=fillSteps.findIndex(s=>s.id===dragId);const to=fillSteps.findIndex(s=>s.id===tid);const[moved]=fillSteps.splice(from,1);fillSteps.splice(to,0,moved);window._fillSteps=fillSteps;for(let i=0;i<fillSteps.length;i++){fillSteps[i].sortIndex=i;await saveItem("fillSteps",fillSteps[i].id,fillSteps[i]);}renderFillSteps();dragId=null;}
+</script>
+</body>
+</html>
